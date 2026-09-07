@@ -497,7 +497,18 @@ function hasGitRepo() {
 }
 
 async function git(args, cwd = REPO_DIR) {
-  return execFileAsync('git', ['-C', cwd, ...args], { cwd });
+  return execFileAsync('git', ['-C', cwd, ...args], {
+    cwd,
+    timeout: 30000,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo' }
+  });
+}
+
+function gitNoRepo(args) {
+  return execFileAsync('git', args, {
+    timeout: 30000,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo' }
+  });
 }
 
 async function getLocalVersion() {
@@ -516,23 +527,39 @@ async function getLocalVersion() {
 
 async function getRemoteSha() {
   // Intento 1: git ls-remote (no necesita clon, funciona fuera del repo)
+  // Con GIT_TERMINAL_PROMPT=0 falla rápido en vez de quedarse colgado pidiendo login
   try {
-    const { stdout } = await execFileAsync('git', ['ls-remote', remoteUrl(), UPDATE_BRANCH]);
+    console.log('[update] Preguntando SHA remoto (ls-remote)...');
+    const { stdout } = await gitNoRepo(['ls-remote', remoteUrl(), UPDATE_BRANCH]);
     const sha = stdout.split(/\s/)[0];
     if (sha && /^[0-9a-f]{5,40}$/.test(sha)) return sha;
+    console.log('[update] ls-remote sin SHA válido, pruebo API...');
   } catch (e) {
-    // Si el repo es privado y no hay token, ls-remote falla con 128
-    if (!githubToken() && /128|authentication|not found/i.test(e.message)) {
+    console.log(`[update] ls-remote falló (${e.message.split('\n')[0]}), pruebo API...`);
+    // Si el repo es privado y no hay token, no reintentes a ciegas
+    if (!githubToken() && /128|authentication|not found|could not read/i.test(e.message)) {
       throw new Error(`no puedo leer ${UPDATE_REPO} (privado). Pon GITHUB_TOKEN en .env en el hosting.`);
     }
+    // otro error: sigo a la API como fallback
   }
-  // Intento 2: API de GitHub (sirve sin git instalado)
+  // Intento 2: API de GitHub (sirve sin git instalado), con timeout para no colgarse
   const headers = { 'User-Agent': 'infinite-bot-updater' };
   if (githubToken()) headers.Authorization = `Bearer ${githubToken()}`;
-  const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/commits/${UPDATE_BRANCH}`, { headers });
-  if (!res.ok) throw new Error(`GitHub API ${res.status}. ${githubToken() ? '' : 'Si el repo es privado pon GITHUB_TOKEN.'}`);
-  const data = await res.json();
-  return data.sha;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    console.log('[update] Preguntando SHA remoto (API)...');
+    const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/commits/${UPDATE_BRANCH}`, { headers, signal: ctrl.signal });
+    if (!res.ok) throw new Error(`GitHub API ${res.status}. ${githubToken() ? '' : 'Si el repo es privado pon GITHUB_TOKEN.'}`);
+    const data = await res.json();
+    if (!data.sha) throw new Error('API sin sha en respuesta.');
+    return data.sha;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('timeout contactando GitHub API (15s). Revisa red del hosting.');
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 // Archivos/carpetas que NUNCA se pisan en el hosting
@@ -586,7 +613,11 @@ async function checkForUpdatesGit(tag) {
 async function checkForUpdatesFresh(tag) {
   // Modo hosting: no hay .git, clono fresco a temp y copio por encima
   const local = await getLocalVersion();
-  console.log(`${tag} Sin repo local, comparando versión (${local}) con GitHub...`);
+  if (local === 'desconocida') {
+    console.log(`${tag} Sin repo local y sin .version (versión desconocida). Asegúrate de subir .version al hosting. Sigo a comparar con GitHub...`);
+  } else {
+    console.log(`${tag} Sin repo local, comparando versión (${local}) con GitHub...`);
+  }
   const remoteFull = await getRemoteSha();
   const remote = remoteFull.slice(0, 7);
   if (local === remote || local === remoteFull.slice(0, 7)) {
@@ -597,7 +628,10 @@ async function checkForUpdatesFresh(tag) {
   console.log(`${tag} Hay update: ${local} -> ${remote}. Clonando...`);
   const tmp = await fsp.mkdtemp(path.join(require('os').tmpdir(), 'ibot-'));
   try {
-    await execFileAsync('git', ['clone', '--depth', '1', '--branch', UPDATE_BRANCH, remoteUrl(), tmp], { timeout: 5 * 60 * 1000 });
+    await execFileAsync('git', ['clone', '--depth', '1', '--branch', UPDATE_BRANCH, remoteUrl(), tmp], {
+      timeout: 5 * 60 * 1000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: 'echo' }
+    });
     const oldPkg = await fsp.readFile(path.join(REPO_DIR, 'package.json'), 'utf8').catch(() => '');
     await copyFreshUpdate(tmp);
     const newPkg = await fsp.readFile(path.join(REPO_DIR, 'package.json'), 'utf8').catch(() => '');
