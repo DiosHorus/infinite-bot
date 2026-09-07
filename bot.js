@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const { joinVoiceChannel, getVoiceConnection, EndBehaviorType } = require('@discordjs/voice');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -37,6 +37,8 @@ const CLIP_SECONDS = 120;
 const MAX_BYTES = 48000 * 2 * 2 * CLIP_SECONDS;
 const CLIP_COOLDOWN_MS = 30 * 1000;
 const DATA_FILE = path.join(__dirname, 'timeData.json');
+const PREFIX_FILE = path.join(__dirname, 'prefixes.json');
+const DEFAULT_PREFIX = 'c!';
 
 // --- Auto-update (GitHub, cada 20h) ---
 const UPDATE_INTERVAL_MS = 20 * 60 * 60 * 1000;
@@ -58,6 +60,31 @@ const clipCooldown = new Map();
 
 // guildId -> Map(userId -> { startTime: number|null, totalTime: number })
 const timeInCall = new Map();
+
+// guildId -> prefix personalizado
+const prefixes = new Map();
+function getPrefix(guildId) {
+  return prefixes.get(guildId) ?? DEFAULT_PREFIX;
+}
+function loadPrefixes() {
+  try {
+    if (!fs.existsSync(PREFIX_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(PREFIX_FILE, 'utf8'));
+    for (const [g, p] of Object.entries(raw)) {
+      if (typeof p === 'string' && p.length >= 1 && p.length <= 5) prefixes.set(g, p);
+    }
+    console.log('Prefijos cargados.');
+  } catch (e) {
+    console.error('No se pudo cargar prefixes.json:', e.message);
+  }
+}
+function savePrefixes() {
+  try {
+    fs.writeFileSync(PREFIX_FILE, JSON.stringify(Object.fromEntries(prefixes), null, 2));
+  } catch (e) {
+    console.error('No se pudo guardar prefixes.json:', e.message);
+  }
+}
 
 function getGuildTimes(guildId) {
   if (!timeInCall.has(guildId)) timeInCall.set(guildId, new Map());
@@ -117,6 +144,7 @@ function saveData() {
 }
 
 loadData();
+loadPrefixes();
 setInterval(saveData, 5 * 60 * 1000).unref();
 
 function formatDuration(ms) {
@@ -154,8 +182,46 @@ function embedInfo(message, title, desc) {
   return embedBase(message, EMBED_COLOR).setTitle(title).setDescription(desc);
 }
 
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`Bot listo como ${client.user.tag}!`);
+  // Registra /prefix global (tarda hasta 1h en propagar; en test usa un server y reinicia)
+  try {
+    const cmd = new SlashCommandBuilder()
+      .setName('prefix')
+      .setDescription('Ver o cambiar el prefijo de comandos de este servidor')
+      .addStringOption(o => o.setName('nuevo').setDescription('Nuevo prefijo (1-5 caracteres, sin espacios)').setRequired(false))
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    await rest.put(Routes.applicationCommands(client.user.id), { body: [cmd.toJSON()] });
+    console.log('Slash /prefix registrado.');
+  } catch (e) {
+    console.error('No se pudo registrar /prefix:', e.message);
+  }
+});
+
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'prefix') return;
+  try {
+    const guildId = interaction.guildId;
+    if (!guildId) return interaction.reply({ content: 'Solo funciona en servidores.', ephemeral: true });
+    const nuevo = interaction.options.getString('nuevo');
+    if (!nuevo) {
+      return interaction.reply({ content: `Prefijo actual: \`${getPrefix(guildId)}\`\nCámbialo con \`/prefix nuevo:!\``, ephemeral: true });
+    }
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: 'Necesitas permiso **Gestionar servidor**.', ephemeral: true });
+    }
+    const p = nuevo.trim();
+    if (p.length < 1 || p.length > 5 || /\s/.test(p)) {
+      return interaction.reply({ content: 'Prefijo inválido: 1-5 caracteres, sin espacios.', ephemeral: true });
+    }
+    prefixes.set(guildId, p);
+    savePrefixes();
+    return interaction.reply({ content: `✅ Prefijo cambiado a \`${p}\`. Ej: \`${p}join\`, \`${p}help\`` });
+  } catch (e) {
+    console.error('Error en /prefix:', e.message);
+    if (!interaction.replied) await interaction.reply({ content: 'Falló al cambiar el prefijo.', ephemeral: true }).catch(() => {});
+  }
 });
 
 client.on('messageCreate', async message => {
@@ -163,9 +229,12 @@ client.on('messageCreate', async message => {
     if (message.author.bot) return;
     if (!message.guild || !message.member) return; // ignora DMs
 
+    const prefix = getPrefix(message.guild.id);
     const content = message.content.toLowerCase().trim();
+    if (!content.startsWith(prefix.toLowerCase())) return;
+    const cmd = content.slice(prefix.length).trim();
 
-    if (content === 'c!join') {
+    if (cmd === 'join') {
       if (!message.member.voice.channel) {
         return message.reply({ embeds: [embedErr(message, 'No estás en voz', 'Debes estar en un canal de voz para que me una.')] });
       }
@@ -174,7 +243,7 @@ client.on('messageCreate', async message => {
 
       // Si ya estoy en ese canal, no reconectar
       if (botChannelIdFor(guildId) === voiceChannel.id) {
-        return message.reply({ embeds: [embedInfo(message, 'Ya estoy aquí', `Estoy en **${voiceChannel.name}**.\nUsa \`c!start\` para grabar · \`c!leave\` para que salga.`)] });
+        return message.reply({ embeds: [embedInfo(message, 'Ya estoy aquí', `Estoy en **${voiceChannel.name}**.\nUsa \`${prefix}start\` para grabar · \`${prefix}leave\` para que salga.`)] });
       }
 
       // Si estaba en otro canal del mismo guild, salir antes
@@ -208,14 +277,14 @@ client.on('messageCreate', async message => {
         });
         saveData();
 
-        return message.reply({ embeds: [embedOk(message, 'Me uní', `Estoy en **${voiceChannel.name}**.\nUsa \`c!start\` para grabar · \`c!leave\` para que salga.`)] });
+        return message.reply({ embeds: [embedOk(message, 'Me uní', `Estoy en **${voiceChannel.name}**.\nUsa \`${prefix}start\` para grabar · \`${prefix}leave\` para que salga.`)] });
       } catch (error) {
         console.error('Error al unirse:', error);
         return message.reply({ embeds: [embedErr(message, 'No pude unirme', 'Revisa que tenga permiso de Conectar y Hablar en ese canal.')] });
       }
     }
 
-    if (content === 'c!leave') {
+    if (cmd === 'leave') {
       const guildId = message.guild.id;
       const conn = getVoiceConnection(guildId) ?? callConnections.get(guildId);
       if (!conn) return message.reply({ embeds: [embedInfo(message, '👋 Nada que hacer', 'No estoy en ningún canal de voz.')] });
@@ -224,34 +293,34 @@ client.on('messageCreate', async message => {
       callConnections.delete(guildId);
       isRecording.set(guildId, false);
       saveData();
-      return message.reply({ embeds: [embedOk(message, 'Me fui', 'Tiempos guardados. Usa `c!join` cuando quieras que vuelva.')] });
+      return message.reply({ embeds: [embedOk(message, 'Me fui', `Tiempos guardados. Usa \`${prefix}join\` cuando quieras que vuelva.`)] });
     }
 
-    if (content === 'c!start') {
+    if (cmd === 'start') {
       const guildId = message.guild.id;
       if (!callConnections.has(guildId)) {
-        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', 'Usa `c!join` primero para que entre al canal.')] });
+        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Usa \`${prefix}join\` primero para que entre al canal.`)] });
       }
       if (isRecording.get(guildId)) {
-        return message.reply({ embeds: [embedInfo(message, '🔴 Ya grabo', 'La grabación ya está activa. Usa `c!stop` para pausarla.')] });
+        return message.reply({ embeds: [embedInfo(message, '🔴 Ya grabo', `La grabación ya está activa. Usa \`${prefix}stop\` para pausarla.`)] });
       }
       isRecording.set(guildId, true);
-      return message.reply({ embeds: [embedOk(message, 'Grabando', 'Grabación activada. Usa `c!stop` para pausar y `c!clip` para un clip.')] });
+      return message.reply({ embeds: [embedOk(message, 'Grabando', `Grabación activada. Usa \`${prefix}stop\` para pausar y \`${prefix}clip\` para un clip.`)] });
     }
 
-    if (content === 'c!stop') {
+    if (cmd === 'stop') {
       const guildId = message.guild.id;
       if (!callConnections.has(guildId)) {
-        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', 'Usa `c!join` primero para que entre al canal.')] });
+        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Usa \`${prefix}join\` primero para que entre al canal.`)] });
       }
       if (!isRecording.get(guildId)) {
-        return message.reply({ embeds: [embedInfo(message, '⏸️ Ya en pausa', 'La grabación ya está detenida. Usa `c!start` para seguir.')] });
+        return message.reply({ embeds: [embedInfo(message, '⏸️ Ya en pausa', `La grabación ya está detenida. Usa \`${prefix}start\` para seguir.`)] });
       }
       isRecording.set(guildId, false);
-      return message.reply({ embeds: [embedOk(message, 'Pausada', 'Grabación detenida. El audio guardado sigue disponible para `c!clip`.')] });
+      return message.reply({ embeds: [embedOk(message, 'Pausada', `Grabación detenida. El audio guardado sigue disponible para \`${prefix}clip\`.`)] });
     }
 
-    if (content === 'c!lb' || content === 'c!clb') {
+    if (cmd === 'lb' || cmd === 'clb') {
       const guildId = message.guild.id;
       const times = getGuildTimes(guildId);
       const botChannelId = botChannelIdFor(guildId);
@@ -278,7 +347,7 @@ client.on('messageCreate', async message => {
         .sort((a, b) => b.totalTime - a.totalTime)
         .slice(0, 10);
 
-      if (leaderboard.length === 0) return message.reply({ embeds: [embedInfo(message, '🏆 Leaderboard vacío', 'Aún no hay tiempo registrado. Usa `c!join` y habla un rato.')] });
+      if (leaderboard.length === 0) return message.reply({ embeds: [embedInfo(message, '🏆 Leaderboard vacío', `Aún no hay tiempo registrado. Usa \`${prefix}join\` y habla un rato.`)] });
 
       const medals = ['🥇', '🥈', '🥉'];
       const lines = [];
@@ -302,16 +371,16 @@ client.on('messageCreate', async message => {
       return message.reply({ embeds: [lbEmbed] });
     }
 
-    if (content === 'c!clip') {
+    if (cmd === 'clip') {
       const guildId = message.guild.id;
       if (!callConnections.has(guildId)) {
-        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', 'Usa `c!join` primero para que entre al canal.')] });
+        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Usa \`${prefix}join\` primero para que entre al canal.`)] });
       }
       const buf = audioBuffers.get(guildId);
       if (!buf || buf.chunks.length === 0) {
         const hint = isRecording.get(guildId)
           ? 'Aún no hay audio. Espera a que alguien hable.'
-          : 'No hay audio. Activa con `c!start` y deja que alguien hable.';
+          : `No hay audio. Activa con \`${prefix}start\` y deja que alguien hable.`;
         return message.reply({ embeds: [embedInfo(message, '✂️ Sin audio todavía', hint)] });
       }
 
@@ -361,23 +430,27 @@ client.on('messageCreate', async message => {
       }
     }
 
-    if (content === 'c!help') {
+    if (cmd === 'help') {
       const embed = new EmbedBuilder()
         .setColor(0x5865F2)
         .setTitle('📖 Comandos de Infinite Bot')
-        .setDescription('Mido tiempo en llamada y genero clips del audio.')
+        .setDescription(`Mido tiempo en llamada y genero clips del audio.\nPrefijo actual: \`${prefix}\` (cámbialo con \`/prefix\`).`)
         .addFields(
-          { name: '🔊 `c!join`', value: 'Me uno a tu canal de voz.', inline: false },
-          { name: '🔴 `c!start`', value: 'Activa la grabación.', inline: false },
-          { name: '⏸️ `c!stop`', value: 'Pausa la grabación (el audio guardado sigue para clips).', inline: false },
-          { name: '👋 `c!leave`', value: 'Guardo tiempos y salgo del canal.', inline: false },
-          { name: '🏆 `c!lb` / `c!clb`', value: 'Top 10 de tiempo en llamada de este servidor.', inline: false },
-          { name: '✂️ `c!clip`', value: `Genera un MP3 con los últimos ${CLIP_SECONDS / 60} min (cooldown 30s).`, inline: false },
-          { name: '❓ `c!help`', value: 'Muestra este mensaje.', inline: false }
+          { name: `🔊 \`${prefix}join\``, value: 'Me uno a tu canal de voz.', inline: false },
+          { name: `🔴 \`${prefix}start\``, value: 'Activa la grabación.', inline: false },
+          { name: `⏸️ \`${prefix}stop\``, value: 'Pausa la grabación (el audio guardado sigue para clips).', inline: false },
+          { name: `👋 \`${prefix}leave\``, value: 'Guardo tiempos y salgo del canal.', inline: false },
+          { name: `🏆 \`${prefix}lb\``, value: 'Top 10 de tiempo en llamada de este servidor.', inline: false },
+          { name: `✂️ \`${prefix}clip\``, value: `Genera un MP3 con los últimos ${CLIP_SECONDS / 60} min (cooldown 30s).`, inline: false },
+          { name: '⚙️ `/prefix`', value: 'Ver o cambiar el prefijo (requiere Gestionar servidor).', inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
         .setTimestamp();
       return message.reply({ embeds: [embed] });
+    }
+
+    if (cmd === 'prefix') {
+      return message.reply({ embeds: [embedInfo(message, '⚙️ Prefijo', `Actual: \`${prefix}\`\nCámbialo con \`/prefix nuevo:!\` (requiere Gestionar servidor).`)] });
     }
   } catch (err) {
     console.error('Error en messageCreate:', err);

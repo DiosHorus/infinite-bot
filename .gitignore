@@ -1,6 +1,7 @@
 node_modules/
 .env
 timeData.json
+prefixes.json
 clips/*.pcm
 clips/*.mp3
 package-lock.zip
