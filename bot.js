@@ -451,31 +451,142 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-// --- Update desde GitHub ---
-function resolveRepoDir() {
-  const candidates = [
-    process.env.REPO_PATH,
-    __dirname,
-    process.cwd()
-  ].filter(Boolean);
-  for (const c of candidates) {
-    try {
-      if (fs.existsSync(path.join(c, '.git'))) return c;
-    } catch { /* noop */ }
-  }
-  return __dirname;
-}
-const REPO_DIR = resolveRepoDir();
+// --- Update desde GitHub (funciona dentro y fuera del repo) ---
+const UPDATE_REPO = process.env.UPDATE_REPO || 'DiosHorus/infinite-bot';
+const UPDATE_BRANCH = process.env.UPDATE_BRANCH || 'main';
+// Directorio de la app (donde está bot.js), sea o no un clon git
+const REPO_DIR = __dirname;
 
-async function git(args) {
-  return execFileAsync('git', ['-C', REPO_DIR, ...args], { cwd: REPO_DIR });
+function githubToken() {
+  return process.env.GITHUB_TOKEN || process.env.GH_TOKEN || null;
+}
+function remoteUrl() {
+  const tok = githubToken();
+  if (tok) return `https://x-access-token:${tok}@github.com/${UPDATE_REPO}.git`;
+  return `https://github.com/${UPDATE_REPO}.git`;
+}
+function hasGitRepo() {
+  try { return fs.existsSync(path.join(REPO_DIR, '.git')); } catch { return false; }
+}
+
+async function git(args, cwd = REPO_DIR) {
+  return execFileAsync('git', ['-C', cwd, ...args], { cwd });
 }
 
 async function getLocalVersion() {
+  // 1) si hay repo git, sha real
   try {
     const { stdout } = await git(['rev-parse', '--short', 'HEAD']);
-    return stdout.trim();
-  } catch { return 'sin-git'; }
+    if (stdout.trim()) return stdout.trim();
+  } catch { /* no hay repo, sigo */ }
+  // 2) fallback a .version (modo hosting sin .git)
+  try {
+    const v = (await fsp.readFile(path.join(REPO_DIR, '.version'), 'utf8')).trim();
+    if (v) return v.slice(0, 7);
+  } catch { /* noop */ }
+  return 'desconocida';
+}
+
+async function getRemoteSha() {
+  // Intento 1: git ls-remote (no necesita clon, funciona fuera del repo)
+  try {
+    const { stdout } = await execFileAsync('git', ['ls-remote', remoteUrl(), UPDATE_BRANCH]);
+    const sha = stdout.split(/\s/)[0];
+    if (sha && /^[0-9a-f]{5,40}$/.test(sha)) return sha;
+  } catch (e) {
+    // Si el repo es privado y no hay token, ls-remote falla con 128
+    if (!githubToken() && /128|authentication|not found/i.test(e.message)) {
+      throw new Error(`no puedo leer ${UPDATE_REPO} (privado). Pon GITHUB_TOKEN en .env en el hosting.`);
+    }
+  }
+  // Intento 2: API de GitHub (sirve sin git instalado)
+  const headers = { 'User-Agent': 'infinite-bot-updater' };
+  if (githubToken()) headers.Authorization = `Bearer ${githubToken()}`;
+  const res = await fetch(`https://api.github.com/repos/${UPDATE_REPO}/commits/${UPDATE_BRANCH}`, { headers });
+  if (!res.ok) throw new Error(`GitHub API ${res.status}. ${githubToken() ? '' : 'Si el repo es privado pon GITHUB_TOKEN.'}`);
+  const data = await res.json();
+  return data.sha;
+}
+
+// Archivos/carpetas que NUNCA se pisan en el hosting
+const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'timeData.json', '.version']);
+
+async function copyFreshUpdate(srcDir) {
+  const entries = await fsp.readdir(srcDir, { withFileTypes: true });
+  for (const ent of entries) {
+    if (UPDATE_EXCLUDE.has(ent.name)) continue;
+    const src = path.join(srcDir, ent.name);
+    const dest = path.join(REPO_DIR, ent.name);
+    await fsp.cp(src, dest, { recursive: true, force: true });
+  }
+}
+
+async function npmInstall(tag) {
+  console.log(`${tag} package.json cambió, corriendo npm install...`);
+  const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const { stdout, stderr } = await execFileAsync(npmCmd, ['install', '--no-audit', '--no-fund'], { cwd: REPO_DIR, timeout: 5 * 60 * 1000 });
+  if (stdout) console.log(stdout.slice(-2000));
+  if (stderr) console.error(stderr.slice(-2000));
+}
+
+async function checkForUpdatesGit(tag) {
+  await git(['fetch', 'origin', UPDATE_BRANCH]);
+  const { stdout: status } = await git(['status', '-uno', '--porcelain', '-b']);
+  const behind = status.match(/behind (\d+)/);
+  if (!behind) {
+    lastUpdateResult = 'sin cambios';
+    console.log(`${tag} Sin cambios. (${status.split('\n')[0]})`);
+    return false;
+  }
+  console.log(`${tag} Hay ${behind[1]} commit(s) nuevos. Descargando...`);
+  const before = await getLocalVersion();
+  const oldPkg = await fsp.readFile(path.join(REPO_DIR, 'package.json'), 'utf8').catch(() => '');
+  await git(['pull', '--ff-only', 'origin', UPDATE_BRANCH]);
+  const after = await getLocalVersion();
+  const newPkg = await fsp.readFile(path.join(REPO_DIR, 'package.json'), 'utf8').catch(() => '');
+  console.log(`${tag} Código actualizado: ${before} -> ${after}`);
+  if (oldPkg !== newPkg) {
+    try { await npmInstall(tag); }
+    catch (e) { console.error(`${tag} npm install falló (sigo con restart):`, e.message); }
+  }
+  try { await fsp.writeFile(path.join(REPO_DIR, '.version'), after); } catch { /* noop */ }
+  lastUpdateResult = `actualizado ${before} -> ${after}`;
+  console.log(`${tag} Reiniciando para aplicar cambios...`);
+  restartBot();
+  return true;
+}
+
+async function checkForUpdatesFresh(tag) {
+  // Modo hosting: no hay .git, clono fresco a temp y copio por encima
+  const local = await getLocalVersion();
+  console.log(`${tag} Sin repo local, comparando versión (${local}) con GitHub...`);
+  const remoteFull = await getRemoteSha();
+  const remote = remoteFull.slice(0, 7);
+  if (local === remote || local === remoteFull.slice(0, 7)) {
+    lastUpdateResult = 'sin cambios';
+    console.log(`${tag} Sin cambios (versión ${local}).`);
+    return false;
+  }
+  console.log(`${tag} Hay update: ${local} -> ${remote}. Clonando...`);
+  const tmp = await fsp.mkdtemp(path.join(require('os').tmpdir(), 'ibot-'));
+  try {
+    await execFileAsync('git', ['clone', '--depth', '1', '--branch', UPDATE_BRANCH, remoteUrl(), tmp], { timeout: 5 * 60 * 1000 });
+    const oldPkg = await fsp.readFile(path.join(REPO_DIR, 'package.json'), 'utf8').catch(() => '');
+    await copyFreshUpdate(tmp);
+    const newPkg = await fsp.readFile(path.join(REPO_DIR, 'package.json'), 'utf8').catch(() => '');
+    await fsp.writeFile(path.join(REPO_DIR, '.version'), remote);
+    console.log(`${tag} Código actualizado: ${local} -> ${remote}`);
+    if (oldPkg !== newPkg) {
+      try { await npmInstall(tag); }
+      catch (e) { console.error(`${tag} npm install falló (sigo con restart):`, e.message); }
+    }
+    lastUpdateResult = `actualizado ${local} -> ${remote}`;
+    console.log(`${tag} Reiniciando para aplicar cambios...`);
+    restartBot();
+    return true;
+  } finally {
+    await fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function checkForUpdates({ auto = false } = {}) {
@@ -487,44 +598,9 @@ async function checkForUpdates({ auto = false } = {}) {
   lastUpdateCheck = new Date();
   const tag = auto ? '[auto-update]' : '[update]';
   try {
-    console.log(`${tag} Comprobando GitHub... (repo: ${REPO_DIR})`);
-    if (!fs.existsSync(path.join(REPO_DIR, '.git'))) {
-      throw new Error(
-        `no hay .git en ${REPO_DIR}. Corre el bot desde Kali con: cd ~/infinite-bot && node bot.js (no desde PowerShell/UNC). O pon REPO_PATH=/home/Loco/infinite-bot`
-      );
-    }
-    // fetch + pull ff-only para no romper cambios locales
-    await git(['fetch', 'origin', 'main']);
-    const { stdout: status } = await git(['status', '-uno', '--porcelain', '-b']);
-    const behind = status.match(/behind (\d+)/);
-    if (!behind) {
-      lastUpdateResult = 'sin cambios';
-      console.log(`${tag} Sin cambios. (${status.split('\n')[0]})`);
-      return false;
-    }
-    console.log(`${tag} Hay ${behind[1]} commit(s) nuevos. Descargando...`);
-    const before = await getLocalVersion();
-    await git(['pull', '--ff-only', 'origin', 'main']);
-    const after = await getLocalVersion();
-    console.log(`${tag} Código actualizado: ${before} -> ${after}`);
-
-    // Si cambió package.json, reinstala deps
-    try {
-      const { stdout: diff } = await git(['diff', '--name-only', `${before}..${after}`]);
-      if (diff.includes('package.json')) {
-        console.log(`${tag} package.json cambió, corriendo npm install...`);
-        const { stdout, stderr } = await execFileAsync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--no-audit', '--no-fund'], { cwd: REPO_DIR, timeout: 5 * 60 * 1000 });
-        if (stdout) console.log(stdout.slice(-2000));
-        if (stderr) console.error(stderr.slice(-2000));
-      }
-    } catch (e) {
-      console.error(`${tag} npm install falló (sigo con restart):`, e.message);
-    }
-
-    lastUpdateResult = `actualizado ${before} -> ${after}`;
-    console.log(`${tag} Reiniciando para aplicar cambios...`);
-    restartBot();
-    return true;
+    console.log(`${tag} Comprobando GitHub ${UPDATE_REPO}#${UPDATE_BRANCH}... (dir: ${REPO_DIR}, git: ${hasGitRepo() ? 'sí' : 'no'})`);
+    if (hasGitRepo()) return await checkForUpdatesGit(tag);
+    return await checkForUpdatesFresh(tag);
   } catch (e) {
     lastUpdateResult = `error: ${e.message}`;
     console.error(`${tag} Falló:`, e.message);
