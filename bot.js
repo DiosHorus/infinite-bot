@@ -452,9 +452,28 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 // --- Update desde GitHub ---
+function resolveRepoDir() {
+  const candidates = [
+    process.env.REPO_PATH,
+    __dirname,
+    process.cwd()
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(path.join(c, '.git'))) return c;
+    } catch { /* noop */ }
+  }
+  return __dirname;
+}
+const REPO_DIR = resolveRepoDir();
+
+async function git(args) {
+  return execFileAsync('git', ['-C', REPO_DIR, ...args], { cwd: REPO_DIR });
+}
+
 async function getLocalVersion() {
   try {
-    const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd: __dirname });
+    const { stdout } = await git(['rev-parse', '--short', 'HEAD']);
     return stdout.trim();
   } catch { return 'sin-git'; }
 }
@@ -468,10 +487,15 @@ async function checkForUpdates({ auto = false } = {}) {
   lastUpdateCheck = new Date();
   const tag = auto ? '[auto-update]' : '[update]';
   try {
-    console.log(`${tag} Comprobando GitHub...`);
+    console.log(`${tag} Comprobando GitHub... (repo: ${REPO_DIR})`);
+    if (!fs.existsSync(path.join(REPO_DIR, '.git'))) {
+      throw new Error(
+        `no hay .git en ${REPO_DIR}. Corre el bot desde Kali con: cd ~/infinite-bot && node bot.js (no desde PowerShell/UNC). O pon REPO_PATH=/home/Loco/infinite-bot`
+      );
+    }
     // fetch + pull ff-only para no romper cambios locales
-    await execFileAsync('git', ['fetch', 'origin', 'main'], { cwd: __dirname });
-    const { stdout: status } = await execFileAsync('git', ['status', '-uno', '--porcelain', '-b'], { cwd: __dirname });
+    await git(['fetch', 'origin', 'main']);
+    const { stdout: status } = await git(['status', '-uno', '--porcelain', '-b']);
     const behind = status.match(/behind (\d+)/);
     if (!behind) {
       lastUpdateResult = 'sin cambios';
@@ -480,16 +504,16 @@ async function checkForUpdates({ auto = false } = {}) {
     }
     console.log(`${tag} Hay ${behind[1]} commit(s) nuevos. Descargando...`);
     const before = await getLocalVersion();
-    await execFileAsync('git', ['pull', '--ff-only', 'origin', 'main'], { cwd: __dirname });
+    await git(['pull', '--ff-only', 'origin', 'main']);
     const after = await getLocalVersion();
     console.log(`${tag} Código actualizado: ${before} -> ${after}`);
 
     // Si cambió package.json, reinstala deps
     try {
-      const { stdout: diff } = await execFileAsync('git', ['diff', '--name-only', `${before}..${after}`], { cwd: __dirname });
+      const { stdout: diff } = await git(['diff', '--name-only', `${before}..${after}`]);
       if (diff.includes('package.json')) {
         console.log(`${tag} package.json cambió, corriendo npm install...`);
-        const { stdout, stderr } = await execFileAsync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--no-audit', '--no-fund'], { cwd: __dirname, timeout: 5 * 60 * 1000 });
+        const { stdout, stderr } = await execFileAsync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--no-audit', '--no-fund'], { cwd: REPO_DIR, timeout: 5 * 60 * 1000 });
         if (stdout) console.log(stdout.slice(-2000));
         if (stderr) console.error(stderr.slice(-2000));
       }
@@ -519,7 +543,7 @@ function restartBot() {
   try { client.destroy(); } catch { /* noop */ }
   // Re-lanza el mismo comando con el que se arrancó
   const child = spawn(process.execPath, process.argv.slice(1), {
-    cwd: __dirname,
+    cwd: REPO_DIR,
     detached: true,
     stdio: 'inherit'
   });
@@ -561,6 +585,7 @@ function setupConsole() {
       case 'status': {
         const v = await getLocalVersion();
         console.log(`versión: ${v} · uptime: ${Math.floor(process.uptime())}s`);
+        console.log(`repo: ${REPO_DIR} (.git: ${fs.existsSync(path.join(REPO_DIR, '.git')) ? 'sí' : 'NO'})`);
         console.log(`guilds: ${client.guilds.cache.size} · voz: ${callConnections.size}`);
         console.log(`último check update: ${lastUpdateCheck ? lastUpdateCheck.toLocaleString() : '—'} (${lastUpdateResult})`);
         break;
