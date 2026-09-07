@@ -47,6 +47,8 @@ let lastUpdateResult = 'nunca';
 
 // guildId -> { chunks: Buffer[], byteLength: number }
 const audioBuffers = new Map();
+// guildId -> grabando (c!start / c!stop). c!join ya no graba solo.
+const isRecording = new Map();
 // guildId -> connection
 const callConnections = new Map();
 // userId (por guild) -> stream activo
@@ -172,7 +174,7 @@ client.on('messageCreate', async message => {
 
       // Si ya estoy en ese canal, no reconectar
       if (botChannelIdFor(guildId) === voiceChannel.id) {
-        return message.reply({ embeds: [embedInfo(message, '🎙️ Ya estoy aquí', 'Ya estoy en tu canal grabando.')] });
+        return message.reply({ embeds: [embedInfo(message, 'Ya estoy aquí', `Estoy en **${voiceChannel.name}**.\nUsa \`c!start\` para grabar · \`c!leave\` para que salga.`)] });
       }
 
       // Si estaba en otro canal del mismo guild, salir antes
@@ -190,6 +192,7 @@ client.on('messageCreate', async message => {
         });
         callConnections.set(guildId, connection);
         setupAudioReceiver(connection, guildId);
+        isRecording.set(guildId, false);
 
         const times = getGuildTimes(guildId);
         const now = Date.now();
@@ -205,7 +208,7 @@ client.on('messageCreate', async message => {
         });
         saveData();
 
-        return message.reply({ embeds: [embedOk(message, 'Grabando', `En **${voiceChannel.name}**. Grabando audio.\nUsa \`c!leave\` para que me vaya · \`c!clip\` para un clip · \`c!help\` para ayuda.`)] });
+        return message.reply({ embeds: [embedOk(message, 'Me uní', `Estoy en **${voiceChannel.name}**.\nUsa \`c!start\` para grabar · \`c!leave\` para que salga.`)] });
       } catch (error) {
         console.error('Error al unirse:', error);
         return message.reply({ embeds: [embedErr(message, 'No pude unirme', 'Revisa que tenga permiso de Conectar y Hablar en ese canal.')] });
@@ -219,8 +222,33 @@ client.on('messageCreate', async message => {
       finalizeGuildTimes(guildId);
       try { conn.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
+      isRecording.set(guildId, false);
       saveData();
       return message.reply({ embeds: [embedOk(message, 'Me fui', 'Tiempos guardados. Usa `c!join` cuando quieras que vuelva.')] });
+    }
+
+    if (content === 'c!start') {
+      const guildId = message.guild.id;
+      if (!callConnections.has(guildId)) {
+        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', 'Usa `c!join` primero para que entre al canal.')] });
+      }
+      if (isRecording.get(guildId)) {
+        return message.reply({ embeds: [embedInfo(message, '🔴 Ya grabo', 'La grabación ya está activa. Usa `c!stop` para pausarla.')] });
+      }
+      isRecording.set(guildId, true);
+      return message.reply({ embeds: [embedOk(message, 'Grabando', 'Grabación activada. Usa `c!stop` para pausar y `c!clip` para un clip.')] });
+    }
+
+    if (content === 'c!stop') {
+      const guildId = message.guild.id;
+      if (!callConnections.has(guildId)) {
+        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', 'Usa `c!join` primero para que entre al canal.')] });
+      }
+      if (!isRecording.get(guildId)) {
+        return message.reply({ embeds: [embedInfo(message, '⏸️ Ya en pausa', 'La grabación ya está detenida. Usa `c!start` para seguir.')] });
+      }
+      isRecording.set(guildId, false);
+      return message.reply({ embeds: [embedOk(message, 'Pausada', 'Grabación detenida. El audio guardado sigue disponible para `c!clip`.')] });
     }
 
     if (content === 'c!lb' || content === 'c!clb') {
@@ -277,11 +305,14 @@ client.on('messageCreate', async message => {
     if (content === 'c!clip') {
       const guildId = message.guild.id;
       if (!callConnections.has(guildId)) {
-        return message.reply({ embeds: [embedErr(message, 'No estoy grabando', 'Usa `c!join` primero para que entre al canal.')] });
+        return message.reply({ embeds: [embedErr(message, 'No estoy en voz', 'Usa `c!join` primero para que entre al canal.')] });
       }
       const buf = audioBuffers.get(guildId);
       if (!buf || buf.chunks.length === 0) {
-        return message.reply({ embeds: [embedInfo(message, '✂️ Sin audio todavía', 'Aún no hay audio grabado. Espera a que alguien hable.')] });
+        const hint = isRecording.get(guildId)
+          ? 'Aún no hay audio. Espera a que alguien hable.'
+          : 'No hay audio. Activa con `c!start` y deja que alguien hable.';
+        return message.reply({ embeds: [embedInfo(message, '✂️ Sin audio todavía', hint)] });
       }
 
       const last = clipCooldown.get(guildId) ?? 0;
@@ -334,9 +365,11 @@ client.on('messageCreate', async message => {
       const embed = new EmbedBuilder()
         .setColor(0x5865F2)
         .setTitle('📖 Comandos de Infinite Bot')
-        .setDescription('Grabo voz, mido tiempo en llamada y genero clips.')
+        .setDescription('Mido tiempo en llamada y genero clips del audio.')
         .addFields(
-          { name: '🎙️ `c!join`', value: 'Me uno a tu canal de voz y empiezo a grabar.', inline: false },
+          { name: '🔊 `c!join`', value: 'Me uno a tu canal de voz.', inline: false },
+          { name: '🔴 `c!start`', value: 'Activa la grabación.', inline: false },
+          { name: '⏸️ `c!stop`', value: 'Pausa la grabación (el audio guardado sigue para clips).', inline: false },
           { name: '👋 `c!leave`', value: 'Guardo tiempos y salgo del canal.', inline: false },
           { name: '🏆 `c!lb` / `c!clb`', value: 'Top 10 de tiempo en llamada de este servidor.', inline: false },
           { name: '✂️ `c!clip`', value: `Genera un MP3 con los últimos ${CLIP_SECONDS / 60} min (cooldown 30s).`, inline: false },
@@ -371,6 +404,7 @@ function setupAudioReceiver(connection, guildId) {
     const cleanup = () => { audioStreams.delete(key); };
 
     audioStream.on('data', (chunk) => {
+      if (!isRecording.get(guildId)) return;
       pushAudioChunk(guildId, chunk);
     });
 
@@ -410,6 +444,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     if (newState.channelId == null) {
       finalizeGuildTimes(newState.guild.id);
       callConnections.delete(newState.guild.id);
+      isRecording.set(newState.guild.id, false);
       saveData();
     }
     return;
@@ -456,6 +491,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         const conn = getVoiceConnection(guildId) ?? callConnections.get(guildId);
         try { conn?.destroy(); } catch { /* noop */ }
         callConnections.delete(guildId);
+        isRecording.set(guildId, false);
         saveData();
         console.log(`Canal ${botChannelId} vacío, saliendo.`);
       }
