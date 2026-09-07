@@ -601,7 +601,11 @@ async function checkForUpdatesGit(tag) {
   console.log(`${tag} Código actualizado: ${before} -> ${after}`);
   if (oldPkg !== newPkg) {
     try { await npmInstall(tag); }
-    catch (e) { console.error(`${tag} npm install falló (sigo con restart):`, e.message); }
+    catch (e) {
+      lastUpdateResult = `error npm install, no reinicio: ${e.message.split('\n')[0]}`;
+      console.error(`${tag} npm install falló, NO reinicio para no dejar node_modules roto:`, e.message);
+      return false;
+    }
   }
   try { await fsp.writeFile(path.join(REPO_DIR, '.version'), after); } catch { /* noop */ }
   lastUpdateResult = `actualizado ${before} -> ${after}`;
@@ -639,7 +643,11 @@ async function checkForUpdatesFresh(tag) {
     console.log(`${tag} Código actualizado: ${local} -> ${remote}`);
     if (oldPkg !== newPkg) {
       try { await npmInstall(tag); }
-      catch (e) { console.error(`${tag} npm install falló (sigo con restart):`, e.message); }
+      catch (e) {
+        lastUpdateResult = `error npm install, no reinicio: ${e.message.split('\n')[0]}`;
+        console.error(`${tag} npm install falló, NO reinicio para no dejar node_modules roto:`, e.message);
+        return false;
+      }
     }
     lastUpdateResult = `actualizado ${local} -> ${remote}`;
     console.log(`${tag} Reiniciando para aplicar cambios...`);

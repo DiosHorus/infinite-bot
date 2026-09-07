@@ -4,3 +4,5 @@ timeData.json
 clips/*.pcm
 clips/*.mp3
 package-lock.zip
+*.log
+*:Zone.Identifier
