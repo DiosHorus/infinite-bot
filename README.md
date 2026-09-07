@@ -64,7 +64,3 @@ El update funciona igual sin clon: compara `.version` con GitHub, clona fresco a
 ## ⚠️ Aviso de grabación
 
 Grabar voz sin avisar puede ser ilegal según tu país. Usa `c!start` a la vista de todos y avisa en las normas del servidor.
-
-## 📄 Licencia
-
-ISC
