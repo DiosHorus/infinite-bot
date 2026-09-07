@@ -554,24 +554,8 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     }
   }
 
-  // Auto-leave si me quedé solo
-  try {
-    const ch = newState.guild.channels.cache.get(botChannelId);
-    if (ch) {
-      const humansLeft = ch.members.filter(m => !m.user.bot).size;
-      if (humansLeft === 0) {
-        finalizeGuildTimes(guildId);
-        const conn = getVoiceConnection(guildId) ?? callConnections.get(guildId);
-        try { conn?.destroy(); } catch { /* noop */ }
-        callConnections.delete(guildId);
-        isRecording.set(guildId, false);
-        saveData();
-        console.log(`Canal ${botChannelId} vacío, saliendo.`);
-      }
-    }
-  } catch (e) {
-    console.error('Error en auto-leave:', e.message);
-  }
+  // Infinity: el bot NO se sale solo aunque el canal quede vacío (hours farmer).
+  // Solo sale con c!leave o si lo expulsan/desconectan.
 });
 
 function shutdown() {
