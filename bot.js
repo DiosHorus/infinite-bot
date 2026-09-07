@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
 const { joinVoiceChannel, getVoiceConnection, EndBehaviorType } = require('@discordjs/voice');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -304,7 +304,20 @@ client.on('messageCreate', async message => {
     }
 
     if (content === 'c!help') {
-      return message.reply('Comandos: `c!join` unirse y grabar · `c!leave` salir · `c!lb` leaderboard · `c!clip` últimos 2 min (30s cooldown)');
+      const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('📖 Comandos de Infinite Bot')
+        .setDescription('Grabo voz, mido tiempo en llamada y genero clips.')
+        .addFields(
+          { name: '🎙️ `c!join`', value: 'Me uno a tu canal de voz y empiezo a grabar.', inline: false },
+          { name: '👋 `c!leave`', value: 'Guardo tiempos y salgo del canal.', inline: false },
+          { name: '🏆 `c!lb` / `c!clb`', value: 'Top 10 de tiempo en llamada de este servidor.', inline: false },
+          { name: '✂️ `c!clip`', value: `Genera un MP3 con los últimos ${CLIP_SECONDS / 60} min (cooldown 30s).`, inline: false },
+          { name: '❓ `c!help`', value: 'Muestra este mensaje.', inline: false }
+        )
+        .setFooter({ text: `Pedido por ${message.author.username}` })
+        .setTimestamp();
+      return message.reply({ embeds: [embed] });
     }
   } catch (err) {
     console.error('Error en messageCreate:', err);
