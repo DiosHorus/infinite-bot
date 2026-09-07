@@ -800,6 +800,157 @@ function setupAutoUpdate() {
   console.log(`Auto-update activado: cada 20h desde GitHub (origin/main).`);
 }
 
+// --- Autodebug y autoreparación ---
+const DEBUG_INTERVAL_MS = 30 * 60 * 1000;
+
+async function runDiagnostics({ fix = false } = {}) {
+  const checks = [];
+  const add = (name, ok, detail = '', fixed = false) => checks.push({ name, ok, detail, fixed });
+
+  // 1) Node
+  const major = Number(process.versions.node.split('.')[0]);
+  add('node', major >= 18, `v${process.versions.node}${major < 20 ? ' (recomendado 20+)' : ''}`);
+
+  // 2) Token
+  const tok = process.env.DISCORD_TOKEN ?? '';
+  add('token', tok.length > 20 && tok.split('.').length === 3, tok ? 'presente' : 'falta DISCORD_TOKEN en .env');
+
+  // 3) ffmpeg
+  try {
+    await execFileAsync('ffmpeg', ['-version'], { timeout: 10000 });
+    add('ffmpeg', true, 'disponible');
+  } catch (e) {
+    add('ffmpeg', false, 'no encontrado en PATH (los clips MP3 fallarán)');
+  }
+
+  // 4) git (necesario para update)
+  try {
+    const { stdout } = await execFileAsync('git', ['--version'], { timeout: 10000 });
+    add('git', true, stdout.trim());
+  } catch {
+    add('git', false, 'no instalado (el update por clon fallará)');
+  }
+
+  // 5) Dependencias
+  const deps = ['discord.js', '@discordjs/voice', '@discordjs/opus', 'libsodium-wrappers', 'prism-media', 'dotenv'];
+  const missing = deps.filter(d => {
+    try { require.resolve(d); return false; } catch { return true; }
+  });
+  if (missing.length === 0) {
+    add('deps', true, 'todas presentes');
+  } else if (fix) {
+    try {
+      console.log(`[debug] Faltan ${missing.join(', ')}, corriendo npm install...`);
+      await npmInstall('[debug]');
+      const still = deps.filter(d => {
+        try { require.resolve(d); return false; } catch { return true; }
+      });
+      add('deps', still.length === 0, still.length ? `siguen faltando: ${still.join(', ')}` : `reparadas: ${missing.join(', ')}`, still.length === 0);
+    } catch (e) {
+      add('deps', false, `faltan ${missing.join(', ')} y npm falló: ${e.message.split('\n')[0]}`);
+    }
+  } else {
+    add('deps', false, `faltan: ${missing.join(', ')} (corre "debug fix")`);
+  }
+
+  // 6) Carpeta clips escribible
+  try {
+    await fsp.mkdir(clipsDir, { recursive: true });
+    const probe = path.join(clipsDir, '.writetest');
+    await fsp.writeFile(probe, 'ok');
+    await fsp.unlink(probe);
+    add('clips', true, 'escribible');
+  } catch (e) {
+    add('clips', false, `sin escritura: ${e.message}`);
+  }
+
+  // 7-8) JSONs corruptos -> backup + reset (solo con fix)
+  for (const [label, file, loader] of [
+    ['tiempos', DATA_FILE, loadData],
+    ['prefijos', PREFIX_FILE, loadPrefixes]
+  ]) {
+    try {
+      if (fs.existsSync(file)) JSON.parse(fs.readFileSync(file, 'utf8'));
+      add(label, true, 'ok');
+    } catch (e) {
+      if (fix) {
+        try {
+          const bak = `${file}.bak-${Date.now()}`;
+          fs.renameSync(file, bak);
+          loader();
+          add(label, false, `corrupto, backup en ${path.basename(bak)} y reseteado`, true);
+        } catch (e2) {
+          add(label, false, `corrupto y no pude reparar: ${e2.message}`);
+        }
+      } else {
+        add(label, false, `corrupto: ${e.message} (corre "debug fix")`);
+      }
+    }
+  }
+
+  // 9) Temporales rancios
+  try {
+    const files = await fsp.readdir(clipsDir).catch(() => []);
+    const stale = [];
+    const now = Date.now();
+    for (const f of files) {
+      if (!/^(temp_|clip_).*\.(pcm|mp3)$/.test(f)) continue;
+      const st = await fsp.stat(path.join(clipsDir, f)).catch(() => null);
+      if (st && now - st.mtimeMs > 60 * 60 * 1000) stale.push(f);
+    }
+    if (stale.length === 0) {
+      add('temporales', true, 'limpio');
+    } else if (fix) {
+      for (const f of stale) await fsp.unlink(path.join(clipsDir, f)).catch(() => {});
+      add('temporales', true, `${stale.length} archivo(s) rancio(s) eliminado(s)`, true);
+    } else {
+      add('temporales', false, `${stale.length} archivo(s) de >1h (corre "debug fix")`);
+    }
+  } catch (e) {
+    add('temporales', false, e.message);
+  }
+
+  // 10) Conexión Discord
+  if (client.user) {
+    const ping = client.ws.ping >= 0 ? `${client.ws.ping}ms` : 'n/a';
+    add('discord', client.ws.status === 0, `como ${client.user.tag} · ping ${ping}${client.ws.status !== 0 ? ` · ws=${client.ws.status}` : ''}`);
+  } else {
+    add('discord', false, 'no logueado (revisa token e intents)');
+  }
+
+  // 11) Conexiones de voz zombies
+  let zombies = 0;
+  for (const [gid, conn] of callConnections) {
+    try {
+      const live = getVoiceConnection(gid);
+      const status = conn?.state?.status ?? 'desconocido';
+      if (!live || ['destroyed', 'disconnected'].includes(status)) {
+        zombies++;
+        if (fix) {
+          try { conn?.destroy(); } catch { /* noop */ }
+          callConnections.delete(gid);
+          isRecording.set(gid, false);
+        }
+      }
+    } catch { zombies++; }
+  }
+  add('voz', zombies === 0, zombies ? `${zombies} conexión(es) zombie${fix ? ' (limpiadas)' : ' (corre "debug fix")'}` : `${callConnections.size} activa(s)`, zombies > 0 && fix);
+
+  const ok = checks.filter(c => c.ok).length;
+  console.log(`[debug] ${ok}/${checks.length} OK${fix ? ' (con reparación)' : ''}:`);
+  for (const c of checks) {
+    console.log(`  ${c.ok ? '✅' : '❌'} ${c.name}${c.detail ? ` — ${c.detail}` : ''}${c.fixed ? ' [reparado]' : ''}`);
+  }
+  return checks;
+}
+
+function setupAutoDebug() {
+  setInterval(() => {
+    runDiagnostics({ fix: true }).catch(e => console.error('[debug]', e.message));
+  }, DEBUG_INTERVAL_MS).unref();
+  console.log('Autodebug activado: chequeo + reparación segura cada 30min.');
+}
+
 // --- Consola de terminal ---
 function setupConsole() {
   const rl = readline.createInterface({
@@ -816,9 +967,11 @@ function setupConsole() {
       case '':
         break;
       case 'help':
-        console.log('Comandos: help · status · update · restart · save · guilds · exit');
+        console.log('Comandos: help · status · debug [fix] · update · restart · save · guilds · exit');
+        console.log('  debug     -> chequea token, ffmpeg, git, deps, clips, jsons, discord y voz');
+        console.log('  debug fix -> lo mismo + repara (npm install, jsons corruptos, temporales, zombies)');
         console.log('  update  -> git pull desde GitHub + npm install si cambió package.json + restart');
-        console.log('  auto-update cada 20h activo' + (AUTO_UPDATE ? '' : ' (DESACTIVADO)'));
+        console.log('  auto-update cada 20h + autodebug cada 30min' + (AUTO_UPDATE ? '' : ' (UPDATE DESACTIVADO)'));
         break;
       case 'status': {
         const v = await getLocalVersion();
@@ -837,6 +990,9 @@ function setupConsole() {
         break;
       case 'update':
         await checkForUpdates({ auto: false });
+        break;
+      case 'debug':
+        await runDiagnostics({ fix: arg === 'fix' || arg === '--fix' });
         break;
       case 'save':
         saveData();
@@ -857,7 +1013,9 @@ function setupConsole() {
   rl.on('close', () => console.log('Consola cerrada (el bot sigue corriendo).'));
 }
 
-client.login(process.env.DISCORD_TOKEN).then(() => {
+client.login(process.env.DISCORD_TOKEN).then(async () => {
   setupConsole();
   setupAutoUpdate();
+  setupAutoDebug();
+  await runDiagnostics({ fix: true }).catch(e => console.error('[debug]', e.message));
 });
