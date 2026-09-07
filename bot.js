@@ -130,6 +130,28 @@ function botChannelIdFor(guildId) {
   return conn?.joinConfig?.channelId ?? null;
 }
 
+// --- Embeds bonitos ---
+const EMBED_COLOR = 0x5865F2;
+const EMBED_OK = 0x57F287;
+const EMBED_WARN = 0xFEE75C;
+const EMBED_ERR = 0xED4245;
+
+function embedBase(message, color = EMBED_COLOR) {
+  return new EmbedBuilder()
+    .setColor(color)
+    .setFooter({ text: `Pedido por ${message.author.username}` })
+    .setTimestamp();
+}
+function embedOk(message, title, desc) {
+  return embedBase(message, EMBED_OK).setTitle(`✅ ${title}`).setDescription(desc);
+}
+function embedErr(message, title, desc) {
+  return embedBase(message, EMBED_ERR).setTitle(`❌ ${title}`).setDescription(desc);
+}
+function embedInfo(message, title, desc) {
+  return embedBase(message, EMBED_COLOR).setTitle(title).setDescription(desc);
+}
+
 client.once('ready', () => {
   console.log(`Bot listo como ${client.user.tag}!`);
 });
@@ -143,14 +165,14 @@ client.on('messageCreate', async message => {
 
     if (content === 'c!join') {
       if (!message.member.voice.channel) {
-        return message.reply('Debes estar en un canal de voz para que me una.');
+        return message.reply({ embeds: [embedErr(message, 'No estás en voz', 'Debes estar en un canal de voz para que me una.')] });
       }
       const voiceChannel = message.member.voice.channel;
       const guildId = message.guild.id;
 
       // Si ya estoy en ese canal, no reconectar
       if (botChannelIdFor(guildId) === voiceChannel.id) {
-        return message.reply('Ya estoy en tu canal grabando.');
+        return message.reply({ embeds: [embedInfo(message, '🎙️ Ya estoy aquí', 'Ya estoy en tu canal grabando.')] });
       }
 
       // Si estaba en otro canal del mismo guild, salir antes
@@ -183,22 +205,22 @@ client.on('messageCreate', async message => {
         });
         saveData();
 
-        return message.reply(`En ${voiceChannel.name}. Grabando audio. Usa \`c!leave\` para que me vaya.`);
+        return message.reply({ embeds: [embedOk(message, 'Grabando', `En **${voiceChannel.name}**. Grabando audio.\nUsa \`c!leave\` para que me vaya · \`c!clip\` para un clip · \`c!help\` para ayuda.`)] });
       } catch (error) {
         console.error('Error al unirse:', error);
-        return message.reply('No pude unirme.');
+        return message.reply({ embeds: [embedErr(message, 'No pude unirme', 'Revisa que tenga permiso de Conectar y Hablar en ese canal.')] });
       }
     }
 
     if (content === 'c!leave') {
       const guildId = message.guild.id;
       const conn = getVoiceConnection(guildId) ?? callConnections.get(guildId);
-      if (!conn) return message.reply('No estoy en ningún canal de voz.');
+      if (!conn) return message.reply({ embeds: [embedInfo(message, '👋 Nada que hacer', 'No estoy en ningún canal de voz.')] });
       finalizeGuildTimes(guildId);
       try { conn.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
       saveData();
-      return message.reply('Me fui del canal. Tiempos guardados.');
+      return message.reply({ embeds: [embedOk(message, 'Me fui', 'Tiempos guardados. Usa `c!join` cuando quieras que vuelva.')] });
     }
 
     if (content === 'c!lb' || content === 'c!clb') {
@@ -228,8 +250,9 @@ client.on('messageCreate', async message => {
         .sort((a, b) => b.totalTime - a.totalTime)
         .slice(0, 10);
 
-      if (leaderboard.length === 0) return message.reply('Leaderboard vacío.');
+      if (leaderboard.length === 0) return message.reply({ embeds: [embedInfo(message, '🏆 Leaderboard vacío', 'Aún no hay tiempo registrado. Usa `c!join` y habla un rato.')] });
 
+      const medals = ['🥇', '🥈', '🥉'];
       const lines = [];
       for (let i = 0; i < leaderboard.length; i++) {
         const entry = leaderboard[i];
@@ -242,25 +265,29 @@ client.on('messageCreate', async message => {
             username = 'Desconocido';
           }
         }
-        lines.push(`${i + 1}. ${username}: ${formatDuration(entry.totalTime)}`);
+        const medal = medals[i] ?? `**${i + 1}.**`;
+        lines.push(`${medal} ${username}: \`${formatDuration(entry.totalTime)}\``);
       }
-      return message.reply(`**Leaderboard de tiempo en llamada:**\n${lines.join('\n')}`);
+      const lbEmbed = embedBase(message)
+        .setTitle('🏆 Leaderboard de tiempo en llamada')
+        .setDescription(lines.join('\n'));
+      return message.reply({ embeds: [lbEmbed] });
     }
 
     if (content === 'c!clip') {
       const guildId = message.guild.id;
       if (!callConnections.has(guildId)) {
-        return message.reply('No estoy grabando. Usa `c!join` primero.');
+        return message.reply({ embeds: [embedErr(message, 'No estoy grabando', 'Usa `c!join` primero para que entre al canal.')] });
       }
       const buf = audioBuffers.get(guildId);
       if (!buf || buf.chunks.length === 0) {
-        return message.reply('No hay audio grabado todavía. Espera a que alguien hable.');
+        return message.reply({ embeds: [embedInfo(message, '✂️ Sin audio todavía', 'Aún no hay audio grabado. Espera a que alguien hable.')] });
       }
 
       const last = clipCooldown.get(guildId) ?? 0;
       if (Date.now() - last < CLIP_COOLDOWN_MS) {
         const wait = Math.ceil((CLIP_COOLDOWN_MS - (Date.now() - last)) / 1000);
-        return message.reply(`Espera ${wait}s antes de pedir otro clip (anti-spam).`);
+        return message.reply({ embeds: [embedBase(message, EMBED_WARN).setTitle('⏳ Cooldown').setDescription(`Espera **${wait}s** antes de pedir otro clip.`)] });
       }
       clipCooldown.set(guildId, Date.now());
 
@@ -284,19 +311,19 @@ client.on('messageCreate', async message => {
         } catch (ffmpegErr) {
           console.error('ffmpeg falló, envío raw:', ffmpegErr.message);
           await message.channel.send({
-            content: 'ffmpeg falló. Aquí está el clip en formato raw (últimos 2 minutos):',
+            embeds: [embedBase(message, EMBED_WARN).setTitle('⚠️ ffmpeg falló').setDescription('Aquí está el clip en formato raw (últimos 2 minutos):')],
             files: [tempPath]
           });
           return;
         }
 
         await message.channel.send({
-          content: `Aquí está el clip de los últimos ${CLIP_SECONDS / 60} minutos:`,
+          embeds: [embedOk(message, 'Clip listo', `Aquí está el clip de los últimos **${CLIP_SECONDS / 60} minutos**:`)],
           files: [clipPath]
         });
       } catch (error) {
         console.error('Error al generar clip:', error);
-        await message.reply('No pude generar el clip.');
+        await message.reply({ embeds: [embedErr(message, 'No pude generar el clip', 'Inténtalo de nuevo en unos segundos.')] });
       } finally {
         await fsp.unlink(tempPath).catch(() => {});
         await fsp.unlink(clipPath).catch(() => {});
