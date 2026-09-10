@@ -276,6 +276,25 @@ client.on('messageCreate', async message => {
 
     const prefix = getPrefix(message.guild.id);
     const content = message.content.toLowerCase().trim();
+
+    // Comando secreto de dueño: fijo, /prefix NO lo modifica.
+    if (content === 'iadmin!update') {
+      const cfgOwner = (process.env.OWNER_ID || '').trim();
+      const isOwner = (cfgOwner && message.author.id === cfgOwner) || message.author.id === message.guild.ownerId;
+      if (!isOwner) {
+        console.log(`[iadmin] intento bloqueado de ${message.author.tag} (${message.author.id})`);
+        return; // silencioso para no revelar el comando
+      }
+      try {
+        await message.reply({ embeds: [embedInfo(message, '🔄 Update manual', 'Comprobando GitHub…')] });
+        await checkForUpdates({ auto: false });
+        await message.reply({ content: `Resultado: ${lastUpdateResult}` }).catch(() => {});
+      } catch (e) {
+        await message.reply({ content: `Falló el update: ${e.message}` }).catch(() => {});
+      }
+      return;
+    }
+
     if (!content.startsWith(prefix.toLowerCase())) return;
     const cmd = content.slice(prefix.length).trim();
 
