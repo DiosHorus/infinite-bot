@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-const { joinVoiceChannel, getVoiceConnection, EndBehaviorType } = require('@discordjs/voice');
+const { joinVoiceChannel, getVoiceConnection, EndBehaviorType, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
@@ -57,6 +57,51 @@ const callConnections = new Map();
 const audioStreams = new Map(); // key `${guildId}:${userId}`
 // guildId -> timestamp ultimo clip
 const clipCooldown = new Map();
+
+// --- Event Logs (ultimos 15 min): entradas/salidas, muteos, transmisiones, sonidos ---
+const LOG_WINDOW_MS = 15 * 60 * 1000;
+const LOG_KEEP_MS = 30 * 60 * 1000;
+// guildId -> [{ t, type, userId, username, detail, sound }]
+const eventLogs = new Map();
+// guildId -> { player } para sonidos
+const guildPlayers = new Map();
+const soundsDir = path.join(__dirname, 'sounds');
+if (!fs.existsSync(soundsDir)) {
+  fs.mkdirSync(soundsDir, { recursive: true });
+}
+
+function logEvent(guildId, type, userId, username, detail = '', extra = {}) {
+  if (!eventLogs.has(guildId)) eventLogs.set(guildId, []);
+  const arr = eventLogs.get(guildId);
+  arr.push({ t: Date.now(), type, userId, username: username || 'Desconocido', detail, ...extra });
+  // poda: quedarnos solo con lo reciente para no crecer en memoria
+  const cutoff = Date.now() - LOG_KEEP_MS;
+  while (arr.length > 0 && arr[0].t < cutoff) arr.shift();
+  if (arr.length > 2000) arr.splice(0, arr.length - 2000);
+}
+
+function getRecentEvents(guildId, windowMs = LOG_WINDOW_MS) {
+  const arr = eventLogs.get(guildId) || [];
+  const cutoff = Date.now() - windowMs;
+  return arr.filter(e => e.t >= cutoff);
+}
+
+function getGuildPlayer(guildId, connection) {
+  let entry = guildPlayers.get(guildId);
+  if (entry?.player) return entry;
+  const player = createAudioPlayer();
+  try { connection.subscribe(player); } catch { /* noop */ }
+  entry = { player };
+  guildPlayers.set(guildId, entry);
+  player.on('error', (e) => console.error(`[sound] player error guild ${guildId}:`, e.message));
+  return entry;
+}
+
+function listSoundFiles() {
+  try {
+    return fs.readdirSync(soundsDir).filter(f => /\.(mp3|wav|ogg|m4a)$/i.test(f));
+  } catch { return []; }
+}
 
 // guildId -> Map(userId -> { startTime: number|null, totalTime: number })
 const timeInCall = new Map();
@@ -430,6 +475,124 @@ client.on('messageCreate', async message => {
       }
     }
 
+    if (cmd === 'sounds' || cmd === 'sonidos') {
+      const files = listSoundFiles();
+      if (files.length === 0) {
+        return message.reply({ embeds: [embedInfo(message, '🔊 Sonidos', `No hay sonidos en \`sounds/\`.\nSube un \`.mp3\` (ej: \`sounds/airhorn.mp3\`) y usalo con \`${prefix}s airhorn\`.`)] });
+      }
+      const names = files.map(f => `\`${path.parse(f).name}\``).join(', ');
+      return message.reply({ embeds: [embedInfo(message, '🔊 Sonidos disponibles', `${names}\n\nUsalos con \`${prefix}s <nombre>\` · Ej: \`${prefix}s ${path.parse(files[0]).name}\``)] });
+    }
+
+    if (cmd === 's' || cmd === 'sound' || cmd.startsWith('s ') || cmd.startsWith('sound ')) {
+      let name = '';
+      if (cmd === 's' || cmd === 'sound') name = '';
+      else if (cmd.startsWith('s ')) name = cmd.slice(2).trim();
+      else if (cmd.startsWith('sound ')) name = cmd.slice(6).trim();
+      if (!name) {
+        return message.reply({ embeds: [embedInfo(message, '🔊 Sonido', `Uso: \`${prefix}s <nombre>\`\nLista: \`${prefix}sounds\``)] });
+      }
+      // sanitiza: solo letras/numeros/guion/guion-bajo
+      if (!/^[\w\-ñáéíóúü]+$/i.test(name)) {
+        return message.reply({ embeds: [embedErr(message, 'Nombre inválido', 'Usa solo letras, números, guion y guion bajo.')] });
+      }
+      const files = listSoundFiles();
+      const file = files.find(f => path.parse(f).name.toLowerCase() === name.toLowerCase());
+      if (!file) {
+        return message.reply({ embeds: [embedErr(message, 'No existe ese sonido', `No encontré \`${name}\`. Lista con \`${prefix}sounds\`.`)] });
+      }
+      let connection = getVoiceConnection(message.guild.id) ?? callConnections.get(message.guild.id);
+      if (!connection) {
+        if (!message.member.voice.channel) {
+          return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Usa \`${prefix}join\` primero o entra a un canal de voz. `)] });
+        }
+        try {
+          connection = joinVoiceChannel({
+            channelId: message.member.voice.channel.id,
+            guildId: message.guild.id,
+            adapterCreator: message.guild.voiceAdapterCreator,
+            selfDeaf: false,
+            selfMute: false
+          });
+          callConnections.set(message.guild.id, connection);
+          setupAudioReceiver(connection, message.guild.id);
+        } catch (e) {
+          console.error('Error al unirse para sonido:', e.message);
+          return message.reply({ embeds: [embedErr(message, 'No pude unirme', 'Revisa permisos de Conectar/Hablar.')] });
+        }
+      }
+      try {
+        const { player } = getGuildPlayer(message.guild.id, connection);
+        const resource = createAudioResource(path.join(soundsDir, file), { inputType: StreamType.Arbitrary });
+        player.play(resource);
+        logEvent(message.guild.id, 'sound', message.author.id, message.author.username, `ejecutó sonido '${path.parse(file).name}'`, { sound: path.parse(file).name.toLowerCase() });
+        return message.reply({ embeds: [embedOk(message, 'Sonido', `🔊 Reproduciendo \`${path.parse(file).name}\``)] });
+      } catch (e) {
+        console.error('Error reproduciendo sonido:', e.message);
+        return message.reply({ embeds: [embedErr(message, 'No pude reproducirlo', e.message)] });
+      }
+    }
+
+    if (cmd === 'logs') {
+      const guildId = message.guild.id;
+      const events = getRecentEvents(guildId, LOG_WINDOW_MS);
+      if (events.length === 0) {
+        return message.reply({ embeds: [embedInfo(message, '📋 Logs (15 min)', 'Sin actividad en los últimos 15 minutos.')] });
+      }
+      const fmtTime = (t) => {
+        const d = new Date(t);
+        return d.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      };
+      const joins = events.filter(e => e.type === 'join');
+      const leaves = events.filter(e => e.type === 'leave');
+      const mutes = events.filter(e => e.type === 'mute');
+      const unmutes = events.filter(e => e.type === 'unmute');
+      const streamStart = events.filter(e => e.type === 'stream_start' || e.type === 'video_start');
+      const streamEnd = events.filter(e => e.type === 'stream_end' || e.type === 'video_end');
+      const sounds = events.filter(e => e.type === 'sound');
+
+      const lines = [];
+      const pushSection = (title, list, mapper, max = 15) => {
+        if (list.length === 0) return;
+        lines.push(`**${title} (${list.length})**`);
+        const shown = list.slice(-max);
+        for (const e of shown) lines.push(`\`${fmtTime(e.t)}\` ${mapper(e)}`);
+        if (list.length > max) lines.push(`_…y ${list.length - max} más_`);
+        lines.push('');
+      };
+
+      pushSection('🟢 Entradas', joins, e => `**${e.username}** entró al canal`);
+      pushSection('🔴 Salidas', leaves, e => `**${e.username}** salió del canal`);
+      pushSection('🔇 Muteos', mutes, e => `**${e.username}** se muteó${e.detail ? ` (${e.detail})` : ''}`);
+      pushSection('🔈 Desmuteos', unmutes, e => `**${e.username}** se desmuteó${e.detail ? ` (${e.detail})` : ''}`);
+      pushSection('📡 Transmisiones iniciadas', streamStart, e => `**${e.username}** inició ${e.type === 'video_start' ? 'cámara' : 'pantalla'}`);
+      pushSection('📴 Transmisiones terminadas', streamEnd, e => `**${e.username}** terminó ${e.type === 'video_end' ? 'cámara' : 'pantalla'}`);
+
+      // Sonidos agregados anti-spam: "juanito ejecutó sonido 'x' x99 veces"
+      if (sounds.length > 0) {
+        const agg = new Map(); // key userId|sound -> { username, sound, count }
+        for (const e of sounds) {
+          const sname = (e.sound || e.detail || 'desconocido').toString();
+          const key = `${e.userId}|${sname}`;
+          if (!agg.has(key)) agg.set(key, { username: e.username, sound: sname, count: 0 });
+          agg.get(key).count++;
+        }
+        const sorted = [...agg.values()].sort((a, b) => b.count - a.count);
+        lines.push(`**🔊 Sonidos (${sounds.length})**`);
+        for (const a of sorted.slice(0, 15)) {
+          lines.push(`**${a.username}** ejecutó sonido '${a.sound}' x${a.count} ${a.count === 1 ? 'vez' : 'veces'}`);
+        }
+        if (sorted.length > 15) lines.push(`_…y ${sorted.length - 15} combinaciones más_`);
+        lines.push('');
+      }
+
+      const desc = lines.join('\n').slice(0, 3900) || 'Sin actividad.';
+      const embed = embedBase(message)
+        .setTitle('📋 Logs — últimos 15 minutos')
+        .setDescription(desc);
+      return message.reply({ embeds: [embed] });
+    }
+
     if (cmd === 'help') {
       const embed = new EmbedBuilder()
         .setColor(0x5865F2)
@@ -442,6 +605,8 @@ client.on('messageCreate', async message => {
           { name: `👋 \`${prefix}leave\``, value: 'Guardo tiempos y salgo del canal.', inline: false },
           { name: `🏆 \`${prefix}lb\``, value: 'Top 10 de tiempo en llamada de este servidor.', inline: false },
           { name: `✂️ \`${prefix}clip\``, value: `Genera un MP3 con los últimos ${CLIP_SECONDS / 60} min (cooldown 30s).`, inline: false },
+          { name: `🔊 \`${prefix}s <nombre>\``, value: `Reproduce un sonido de \`sounds/\`. Lista con \`${prefix}sounds\`.`, inline: false },
+          { name: `📋 \`${prefix}logs\``, value: 'Resumen de los últimos 15 min: entradas/salidas, muteos, transmisiones y sonidos (agregados anti-spam).', inline: false },
           { name: '⚙️ `/prefix`', value: 'Ver o cambiar el prefijo (requiere Gestionar servidor).', inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
@@ -534,6 +699,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 
   const wasInBot = oldState.channelId === botChannelId;
   const isInBot = newState.channelId === botChannelId;
+  const username = newState.member?.user?.username ?? oldState.member?.user?.username ?? 'Desconocido';
 
   if (!wasInBot && isInBot) {
     // Entró (o cambió) al canal del bot
@@ -543,6 +709,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
       prev.startTime = now;
       times.set(userId, prev);
     }
+    logEvent(guildId, 'join', userId, username);
   } else if (wasInBot && !isInBot) {
     // Salió (o cambió) del canal del bot
     const data = times.get(userId);
@@ -551,6 +718,30 @@ client.on('voiceStateUpdate', (oldState, newState) => {
       data.startTime = null;
       times.set(userId, data);
       saveData();
+    }
+    logEvent(guildId, 'leave', userId, username);
+  }
+
+  // Solo loguea mute/transmisión si el usuario está (o estaba) en el canal del bot
+  if (wasInBot || isInBot) {
+    const wasMuted = oldState.mute || oldState.selfMute;
+    const isMuted = newState.mute || newState.selfMute;
+    if (!wasMuted && isMuted) {
+      const detail = newState.serverMute ? 'servidor' : (newState.selfMute ? 'propio' : '');
+      logEvent(guildId, 'mute', userId, username, detail);
+    } else if (wasMuted && !isMuted) {
+      logEvent(guildId, 'unmute', userId, username);
+    }
+
+    if (!oldState.streaming && newState.streaming) {
+      logEvent(guildId, 'stream_start', userId, username, 'pantalla');
+    } else if (oldState.streaming && !newState.streaming) {
+      logEvent(guildId, 'stream_end', userId, username, 'pantalla');
+    }
+    if (!oldState.selfVideo && newState.selfVideo) {
+      logEvent(guildId, 'video_start', userId, username, 'cámara');
+    } else if (oldState.selfVideo && !newState.selfVideo) {
+      logEvent(guildId, 'video_end', userId, username, 'cámara');
     }
   }
 
@@ -656,7 +847,7 @@ async function getRemoteSha() {
 }
 
 // Archivos/carpetas que NUNCA se pisan en el hosting
-const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'timeData.json', '.version']);
+const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'sounds', 'timeData.json', 'prefixes.json', '.version']);
 
 async function copyFreshUpdate(srcDir) {
   const entries = await fsp.readdir(srcDir, { withFileTypes: true });
