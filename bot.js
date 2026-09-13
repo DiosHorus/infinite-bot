@@ -1,13 +1,13 @@
 require('dotenv').config();
 
 const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-const { joinVoiceChannel, getVoiceConnection, EndBehaviorType, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
+const { joinVoiceChannel, getVoiceConnection, EndBehaviorType, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType, VoiceConnectionStatus } = require('@discordjs/voice');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const readline = require('readline');
 const { execFile, spawn } = require('child_process');
-const { promisify } = require('util');
+const { promisify, inspect } = require('util');
 
 const execFileAsync = promisify(execFile);
 
@@ -69,6 +69,46 @@ const soundsDir = path.join(__dirname, 'sounds');
 if (!fs.existsSync(soundsDir)) {
   fs.mkdirSync(soundsDir, { recursive: true });
 }
+
+// --- Logs a archivo (logs/bot-YYYY-MM-DD.log): todo lo que pasa por console + errores ---
+// Sirve para saber qué pasó cuando el bot se cae/sale solo. Rotación: se borran los de +7 días.
+const logsDir = path.join(__dirname, 'logs');
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+}
+const LOG_KEEP_DAYS = 7;
+function logFileFor(d = new Date()) {
+  return path.join(logsDir, `bot-${d.toISOString().slice(0, 10)}.log`);
+}
+function pruneOldLogs() {
+  try {
+    const cutoff = Date.now() - LOG_KEEP_DAYS * 24 * 60 * 60 * 1000;
+    for (const f of fs.readdirSync(logsDir)) {
+      if (!/^bot-\d{4}-\d{2}-\d{2}\.log$/.test(f)) continue;
+      const p = path.join(logsDir, f);
+      try {
+        if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
+      } catch { /* noop */ }
+    }
+  } catch { /* noop */ }
+}
+function writeLogFile(level, args) {
+  try {
+    const ts = new Date().toISOString();
+    const msg = args.map(a => (typeof a === 'string' ? a : inspect(a, { depth: 4, breakLength: 200 }))).join(' ');
+    fs.appendFileSync(logFileFor(), `[${ts}] [${level}] ${msg}\n`);
+  } catch { /* nunca romper el bot por el log */ }
+}
+const _conLog = console.log.bind(console);
+const _conErr = console.error.bind(console);
+const _conWarn = console.warn.bind(console);
+console.log = (...a) => { writeLogFile('INFO', a); _conLog(...a); };
+console.warn = (...a) => { writeLogFile('WARN', a); _conWarn(...a); };
+console.error = (...a) => { writeLogFile('ERROR', a); _conErr(...a); };
+process.on('uncaughtException', (e) => { console.error('[fatal] uncaughtException:', e?.stack || e); });
+process.on('unhandledRejection', (r) => { console.error('[fatal] unhandledRejection:', r?.stack || r); });
+pruneOldLogs();
+setInterval(pruneOldLogs, 24 * 60 * 60 * 1000).unref();
 
 function logEvent(guildId, type, userId, username, detail = '', extra = {}) {
   if (!eventLogs.has(guildId)) eventLogs.set(guildId, []);
@@ -200,9 +240,74 @@ function formatDuration(ms) {
   return `${h}h ${m}m ${s}s`;
 }
 
+// Devuelve la conexión viva o null. Si el mapa guardaba una conexión
+// muerta/fantasma (la causa del "dice que está pero no está"), la limpia
+// y lo deja registrado en el log para saber qué pasó.
+function getLiveConnection(guildId) {
+  const live = getVoiceConnection(guildId);
+  const stored = callConnections.get(guildId);
+  const conn = live ?? stored;
+  if (!conn) return null;
+  if (conn?.state?.status === VoiceConnectionStatus.Destroyed) {
+    if (stored) {
+      console.warn(`[voz] conexión zombie en guild ${guildId} (destroyed), limpiando mapa`);
+      try { stored.destroy(); } catch { /* noop */ }
+      callConnections.delete(guildId);
+      isRecording.set(guildId, false);
+    }
+    return null;
+  }
+  // discord.js ya no la reconoce pero el mapa la guarda: es fantasma.
+  // Se limpia para que `join` reconecte en vez de decir "ya estoy aquí".
+  if (!live && stored) {
+    console.warn(`[voz] conexión fantasma en guild ${guildId} (sin getVoiceConnection), limpiando para reconectar`);
+    try { stored.destroy(); } catch { /* noop */ }
+    callConnections.delete(guildId);
+    isRecording.set(guildId, false);
+    return null;
+  }
+  return conn;
+}
+
 function botChannelIdFor(guildId) {
-  const conn = callConnections.get(guildId);
+  const conn = getLiveConnection(guildId);
   return conn?.joinConfig?.channelId ?? null;
+}
+
+// Registra cada cambio de estado de la conexión: así el log dice por qué se cayó/salió.
+// Si se queda colgada en desconectado >15s, congela tiempos y limpia (antes quedaba fantasma).
+function attachConnectionHandlers(connection, guildId) {
+  try {
+    connection.on('stateChange', (oldS, newS) => {
+      console.log(`[voz] guild ${guildId}: ${oldS.status} -> ${newS.status}`);
+    });
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      console.warn(`[voz] guild ${guildId}: desconectado, esperando reconexión automática (15s)...`);
+      await new Promise(r => setTimeout(r, 15000));
+      try {
+        const cur = getVoiceConnection(guildId);
+        const st = cur?.state?.status;
+        if (!cur || st === VoiceConnectionStatus.Destroyed || st === VoiceConnectionStatus.Disconnected) {
+          console.error(`[voz] guild ${guildId}: no se recuperó (status=${st ?? 'none'}), congelo tiempos y limpio`);
+          finalizeGuildTimes(guildId);
+          try { cur?.destroy(); } catch { /* noop */ }
+          try { connection.destroy(); } catch { /* noop */ }
+          callConnections.delete(guildId);
+          isRecording.set(guildId, false);
+          saveData();
+        } else {
+          console.log(`[voz] guild ${guildId}: reconexión OK (status=${st})`);
+        }
+      } catch (e) {
+        console.error(`[voz] guild ${guildId}: error vigilando desconexión:`, e.message);
+      }
+    });
+    connection.on(VoiceConnectionStatus.Destroyed, () => {
+      console.warn(`[voz] guild ${guildId}: conexión destruida`);
+    });
+  } catch (e) {
+    console.error(`[voz] guild ${guildId}: no pude enganchar handlers:`, e.message);
+  }
 }
 
 // --- Embeds bonitos ---
@@ -325,7 +430,9 @@ client.on('messageCreate', async message => {
         });
         callConnections.set(guildId, connection);
         setupAudioReceiver(connection, guildId);
+        attachConnectionHandlers(connection, guildId);
         isRecording.set(guildId, false);
+        console.log(`[cmd] join guild=${guildId} canal=${voiceChannel.id} por=${message.author.tag}`);
 
         const times = getGuildTimes(guildId);
         const now = Date.now();
@@ -350,8 +457,9 @@ client.on('messageCreate', async message => {
 
     if (cmd === 'leave') {
       const guildId = message.guild.id;
-      const conn = getVoiceConnection(guildId) ?? callConnections.get(guildId);
+      const conn = getLiveConnection(guildId);
       if (!conn) return message.reply({ embeds: [embedInfo(message, '👋 Nada que hacer', 'No estoy en ningún canal de voz.')] });
+      console.log(`[cmd] leave guild=${guildId} por=${message.author.tag}`);
       finalizeGuildTimes(guildId);
       try { conn.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
@@ -362,7 +470,7 @@ client.on('messageCreate', async message => {
 
     if (cmd === 'start') {
       const guildId = message.guild.id;
-      if (!callConnections.has(guildId)) {
+      if (!getLiveConnection(guildId)) {
         return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Usa \`${prefix}join\` primero para que entre al canal.`)] });
       }
       if (isRecording.get(guildId)) {
@@ -374,7 +482,7 @@ client.on('messageCreate', async message => {
 
     if (cmd === 'stop') {
       const guildId = message.guild.id;
-      if (!callConnections.has(guildId)) {
+      if (!getLiveConnection(guildId)) {
         return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Usa \`${prefix}join\` primero para que entre al canal.`)] });
       }
       if (!isRecording.get(guildId)) {
@@ -437,7 +545,7 @@ client.on('messageCreate', async message => {
 
     if (cmd === 'clip') {
       const guildId = message.guild.id;
-      if (!callConnections.has(guildId)) {
+      if (!getLiveConnection(guildId)) {
         return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Usa \`${prefix}join\` primero para que entre al canal.`)] });
       }
       const buf = audioBuffers.get(guildId);
@@ -520,7 +628,7 @@ client.on('messageCreate', async message => {
       if (!file) {
         return message.reply({ embeds: [embedErr(message, 'No existe ese sonido', `No encontré \`${name}\`. Lista con \`${prefix}sounds\`.`)] });
       }
-      let connection = getVoiceConnection(message.guild.id) ?? callConnections.get(message.guild.id);
+      let connection = getLiveConnection(message.guild.id);
       if (!connection) {
         if (!message.member.voice.channel) {
           return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Usa \`${prefix}join\` primero o entra a un canal de voz. `)] });
@@ -535,6 +643,7 @@ client.on('messageCreate', async message => {
           });
           callConnections.set(message.guild.id, connection);
           setupAudioReceiver(connection, message.guild.id);
+          attachConnectionHandlers(connection, message.guild.id);
         } catch (e) {
           console.error('Error al unirse para sonido:', e.message);
           return message.reply({ embeds: [embedErr(message, 'No pude unirme', 'Revisa permisos de Conectar/Hablar.')] });
@@ -696,13 +805,18 @@ function finalizeGuildTimes(guildId) {
 }
 
 client.on('voiceStateUpdate', (oldState, newState) => {
-  // Salida/desconexión del propio bot: congela tiempos y limpia
+  // Cambios de voz del propio bot: se registran SIEMPRE en el log para saber por qué se salió
   if (newState.member?.user.id === client.user?.id) {
+    const gid = newState.guild.id;
     if (newState.channelId == null) {
-      finalizeGuildTimes(newState.guild.id);
-      callConnections.delete(newState.guild.id);
-      isRecording.set(newState.guild.id, false);
+      console.warn(`[voz] BOT salió/desconectado en guild ${gid} (estaba en ${oldState.channelId ?? '???'}). Congelo tiempos y limpio.`);
+      finalizeGuildTimes(gid);
+      try { getVoiceConnection(gid)?.destroy(); } catch { /* noop */ }
+      callConnections.delete(gid);
+      isRecording.set(gid, false);
       saveData();
+    } else if (oldState.channelId !== newState.channelId) {
+      console.log(`[voz] BOT movido en guild ${gid}: ${oldState.channelId ?? '???'} -> ${newState.channelId}`);
     }
     return;
   }
@@ -866,7 +980,7 @@ async function getRemoteSha() {
 }
 
 // Archivos/carpetas que NUNCA se pisan en el hosting
-const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'sounds', 'timeData.json', 'prefixes.json', '.version']);
+const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'sounds', 'logs', 'timeData.json', 'prefixes.json', '.version']);
 
 async function copyFreshUpdate(srcDir) {
   const entries = await fsp.readdir(srcDir, { withFileTypes: true });
@@ -1177,7 +1291,7 @@ function setupConsole() {
       case '':
         break;
       case 'help':
-        console.log('Comandos: help · status · debug [fix] · update · restart · save · guilds · exit');
+        console.log('Comandos: help · status · debug [fix] · update · restart · save · guilds · logs [n] · exit');
         console.log('  debug     -> chequea token, ffmpeg, git, deps, clips, jsons, discord y voz');
         console.log('  debug fix -> lo mismo + repara (npm install, jsons corruptos, temporales, zombies)');
         console.log('  update  -> git pull desde GitHub + npm install si cambió package.json + restart');
@@ -1208,6 +1322,19 @@ function setupConsole() {
         saveData();
         console.log('Datos guardados.');
         break;
+      case 'logs': {
+        const n = Math.min(Math.max(parseInt(arg, 10) || 20, 1), 100);
+        try {
+          const lines = fs.readFileSync(logFileFor(), 'utf8').split('\n').filter(Boolean);
+          const tail = lines.slice(-n);
+          if (tail.length === 0) _conLog('(log de hoy vacío)');
+          else for (const line of tail) _conLog(line);
+          _conLog(`— últimas ${tail.length} líneas de ${path.basename(logFileFor())} —`);
+        } catch (e) {
+          _conLog(`No pude leer el log: ${e.message}`);
+        }
+        break;
+      }
       case 'restart':
         restartBot();
         break;

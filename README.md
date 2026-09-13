@@ -10,7 +10,8 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 - 🔴 **Grabación manual** — `start` / `stop` por servidor, el buffer aguanta ~2 min reales
 - ✂️ **Clips MP3** — convierte el buffer PCM con `ffmpeg`, con cooldown anti-spam (30s)
 - ⚙️ **Prefijo configurable** — `/prefix nuevo:!` por servidor (por defecto `c!`)
-- 💻 **Consola terminal** — `help · status · guilds · update · save · restart · exit`
+- 💻 **Consola terminal** — `help · status · debug [fix] · logs [n] · update · save · guilds · restart · exit`
+- 📝 **Logs a archivo** — todo (`logs/bot-YYYY-MM-DD.log`, rotación 7 días): comandos, salidas del bot, estados de voz y errores
 - 🔄 **Auto-update cada 20h** — desde GitHub (`git pull` si hay repo, clon fresco en hosting) + `npm install` si cambió `package.json` + restart
 - 🎨 **Embeds bonitos** en todos los mensajes
 
