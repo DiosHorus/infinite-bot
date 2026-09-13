@@ -1061,9 +1061,19 @@ async function copyFreshUpdate(srcDir) {
 async function npmInstall(tag) {
   console.log(`${tag} package.json cambió, corriendo npm install...`);
   const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const { stdout, stderr } = await execFileAsync(npmCmd, ['install', '--no-audit', '--no-fund'], { cwd: REPO_DIR, timeout: 5 * 60 * 1000 });
-  if (stdout) console.log(stdout.slice(-2000));
-  if (stderr) console.error(stderr.slice(-2000));
+  try {
+    const { stdout, stderr } = await execFileAsync(npmCmd, ['install', '--no-audit', '--no-fund'], { cwd: REPO_DIR, timeout: 5 * 60 * 1000 });
+    if (stdout) console.log(stdout.slice(-2000));
+    if (stderr) console.error(stderr.slice(-2000));
+  } catch (e) {
+    // El mensaje plano de execFile ("Command failed...") no dice NADA: se vuelca
+    // la cola real al log y se extrae la causa para el `Resultado:` de Discord.
+    if (e.stdout) console.log(`${tag} npm stdout:\n${String(e.stdout).slice(-2000)}`);
+    if (e.stderr) console.error(`${tag} npm stderr:\n${String(e.stderr).slice(-3000)}`);
+    const lines = String(e.stderr || e.stdout || e.message).split('\n').map(l => l.trim()).filter(Boolean);
+    const cause = lines.filter(l => /npm error|ERR!/i.test(l)).slice(-2).join(' | ') || lines.slice(-2).join(' | ') || e.message.split('\n')[0];
+    throw new Error(`npm install falló: ${cause.slice(0, 300)}`);
+  }
 }
 
 async function checkForUpdatesGit(tag) {
@@ -1221,8 +1231,8 @@ async function runDiagnostics({ fix = false } = {}) {
     add('git', false, 'no instalado (el update por clon fallará)');
   }
 
-  // 5) Dependencias
-  const deps = ['discord.js', '@discordjs/voice', '@discordjs/opus', 'libsodium-wrappers', 'prism-media', 'dotenv'];
+  // 5) Dependencias (@discordjs/opus es opcional: lo cubre el chequeo funcional 'opus')
+  const deps = ['discord.js', '@discordjs/voice', 'libsodium-wrappers', 'prism-media', 'dotenv'];
   const missing = deps.filter(d => {
     try { require.resolve(d); return false; } catch { return true; }
   });
