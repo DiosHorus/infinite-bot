@@ -8,6 +8,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFile, spawn } = require('child_process');
 const { promisify, inspect } = require('util');
+const prism = require('prism-media');
 
 const execFileAsync = promisify(execFile);
 
@@ -128,12 +129,15 @@ function getRecentEvents(guildId, windowMs = LOG_WINDOW_MS) {
 
 function getGuildPlayer(guildId, connection) {
   let entry = guildPlayers.get(guildId);
-  if (entry?.player) return entry;
-  const player = createAudioPlayer();
-  try { connection.subscribe(player); } catch { /* noop */ }
-  entry = { player };
-  guildPlayers.set(guildId, entry);
-  player.on('error', (e) => console.error(`[sound] player error guild ${guildId}:`, e.message));
+  if (!entry?.player) {
+    const player = createAudioPlayer();
+    entry = { player };
+    guildPlayers.set(guildId, entry);
+    player.on('error', (e) => console.error(`[sound] player error guild ${guildId}:`, e.message));
+  }
+  // Resuscribir SIEMPRE: tras un leave+join la conexión es nueva y el player
+  // viejo quedaba atado a la destruida (decía "Reproduciendo" en silencio).
+  try { connection.subscribe(entry.player); } catch { /* noop */ }
   return entry;
 }
 
@@ -141,6 +145,16 @@ function listSoundFiles() {
   try {
     return fs.readdirSync(soundsDir).filter(f => /\.(mp3|wav|ogg|m4a)$/i.test(f));
   } catch { return []; }
+}
+
+// --- Motor Opus (necesario para decodificar voz y reproducir sonidos) ---
+// Sin @discordjs/opus ni opusscript, los clips salen vacíos y `c!s` es mudo.
+let OPUS_OK = true;
+try {
+  new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 }).destroy();
+} catch (e) {
+  OPUS_OK = false;
+  console.error('[audio] SIN motor Opus (@discordjs/opus ni opusscript). Clips vacíos y sonidos mudos. Corre `npm install`.');
 }
 
 // guildId -> Map(userId -> { startTime: number|null, totalTime: number })
@@ -250,20 +264,24 @@ function getLiveConnection(guildId) {
   if (!conn) return null;
   if (conn?.state?.status === VoiceConnectionStatus.Destroyed) {
     if (stored) {
-      console.warn(`[voz] conexión zombie en guild ${guildId} (destroyed), limpiando mapa`);
+      console.warn(`[voz] conexión zombie en guild ${guildId} (destroyed), congelo tiempos y limpio mapa`);
+      finalizeGuildTimes(guildId);
       try { stored.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
       isRecording.set(guildId, false);
+      saveData();
     }
     return null;
   }
   // discord.js ya no la reconoce pero el mapa la guarda: es fantasma.
   // Se limpia para que `join` reconecte en vez de decir "ya estoy aquí".
   if (!live && stored) {
-    console.warn(`[voz] conexión fantasma en guild ${guildId} (sin getVoiceConnection), limpiando para reconectar`);
+    console.warn(`[voz] conexión fantasma en guild ${guildId} (sin getVoiceConnection), congelo tiempos y limpio para reconectar`);
+    finalizeGuildTimes(guildId);
     try { stored.destroy(); } catch { /* noop */ }
     callConnections.delete(guildId);
     isRecording.set(guildId, false);
+    saveData();
     return null;
   }
   return conn;
@@ -426,14 +444,18 @@ client.on('messageCreate', async message => {
           guildId,
           adapterCreator: message.guild.voiceAdapterCreator,
           selfDeaf: false,
-          selfMute: true
+          selfMute: false // en false: muteado no transmite y `c!s` sonaría en silencio
         });
         callConnections.set(guildId, connection);
         setupAudioReceiver(connection, guildId);
         attachConnectionHandlers(connection, guildId);
         isRecording.set(guildId, false);
+        audioBuffers.delete(guildId); // sesión nueva: sin restos de audio anterior
         console.log(`[cmd] join guild=${guildId} canal=${voiceChannel.id} por=${message.author.tag}`);
 
+        // Cierro la sesión anterior (otro canal): si no, los startTime viejos
+        // se heredan e inflan el lb de quien entre al canal nuevo.
+        finalizeGuildTimes(guildId);
         const times = getGuildTimes(guildId);
         const now = Date.now();
         voiceChannel.members.forEach(member => {
@@ -561,7 +583,7 @@ client.on('messageCreate', async message => {
         const wait = Math.ceil((CLIP_COOLDOWN_MS - (Date.now() - last)) / 1000);
         return message.reply({ embeds: [embedBase(message, EMBED_WARN).setTitle('⏳ Cooldown').setDescription(`Espera **${wait}s** antes de pedir otro clip.`)] });
       }
-      clipCooldown.set(guildId, Date.now());
+      // El cooldown se marca SOLO si el clip se entrega (si falla, reintento libre).
 
       const stamp = Date.now();
       const tempPath = path.join(clipsDir, `temp_${guildId}_${stamp}.pcm`);
@@ -586,6 +608,7 @@ client.on('messageCreate', async message => {
             embeds: [embedBase(message, EMBED_WARN).setTitle('⚠️ ffmpeg falló').setDescription('Aquí está el clip en formato raw (últimos 2 minutos):')],
             files: [tempPath]
           });
+          clipCooldown.set(guildId, Date.now());
           return;
         }
 
@@ -593,6 +616,7 @@ client.on('messageCreate', async message => {
           embeds: [embedOk(message, 'Clip listo', `Aquí está el clip de los últimos **${CLIP_SECONDS / 60} minutos**:`)],
           files: [clipPath]
         });
+        clipCooldown.set(guildId, Date.now());
       } catch (error) {
         console.error('Error al generar clip:', error);
         await message.reply({ embeds: [embedErr(message, 'No pude generar el clip', 'Inténtalo de nuevo en unos segundos.')] });
@@ -767,11 +791,35 @@ function setupAudioReceiver(connection, guildId) {
       }
     });
 
-    const cleanup = () => { audioStreams.delete(key); };
+    let cleaned = false;
+    let decoder = null;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      audioStreams.delete(key);
+      try { decoder?.destroy(); } catch { /* noop */ }
+    };
 
-    audioStream.on('data', (chunk) => {
+    // subscribe() entrega paquetes Opus comprimidos: hay que decodificar a
+    // PCM s16le antes de guardar, si no el clip es ruido. Sin motor Opus no
+    // se guarda nada (mejor vacío que basura) y se avisa en el log.
+    try {
+      decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
+      audioStream.pipe(decoder);
+    } catch (e) {
+      console.error(`[audio] no puedo decodificar a ${userId} (sin motor Opus):`, e.message);
+      try { audioStream.destroy(); } catch { /* noop */ }
+      return;
+    }
+
+    decoder.on('data', (pcm) => {
       if (!isRecording.get(guildId)) return;
-      pushAudioChunk(guildId, chunk);
+      pushAudioChunk(guildId, pcm);
+    });
+
+    decoder.on('error', (error) => {
+      console.error(`Error decodificando audio de ${userId}:`, error.message);
+      cleanup();
     });
 
     audioStream.on('end', () => {
@@ -816,7 +864,25 @@ client.on('voiceStateUpdate', (oldState, newState) => {
       isRecording.set(gid, false);
       saveData();
     } else if (oldState.channelId !== newState.channelId) {
-      console.log(`[voz] BOT movido en guild ${gid}: ${oldState.channelId ?? '???'} -> ${newState.channelId}`);
+      console.log(`[voz] BOT movido en guild ${gid}: ${oldState.channelId ?? '???'} -> ${newState.channelId}. Re-engancho al canal nuevo.`);
+      // Si no se re-hace la conexión, joinConfig queda con el canal viejo y el
+      // trackeo muere en silencio (compara contra un canal vacío).
+      try {
+        try { getVoiceConnection(gid)?.destroy(); } catch { /* noop */ }
+        callConnections.delete(gid);
+        const conn = joinVoiceChannel({
+          channelId: newState.channelId,
+          guildId: gid,
+          adapterCreator: newState.guild.voiceAdapterCreator,
+          selfDeaf: false,
+          selfMute: false
+        });
+        callConnections.set(gid, conn);
+        setupAudioReceiver(conn, gid);
+        attachConnectionHandlers(conn, gid);
+      } catch (e) {
+        console.error(`[voz] BOT no pudo re-enganchar al canal nuevo en guild ${gid}:`, e.message);
+      }
     }
     return;
   }
@@ -1177,6 +1243,10 @@ async function runDiagnostics({ fix = false } = {}) {
     add('deps', false, `faltan: ${missing.join(', ')} (corre "debug fix")`);
   }
 
+  // 5b) Motor Opus funcional (estar instalado no basta: el nativo puede fallar al cargar).
+  // Sin esto los clips salen vacíos y `c!s` es mudo aunque todo lo demás esté OK.
+  add('opus', OPUS_OK, OPUS_OK ? 'decodificación disponible (clips+sonidos OK)' : 'SIN motor: corre `npm install` (opusscript sirve de respaldo)');
+
   // 6) Carpeta clips escribible
   try {
     await fsp.mkdir(clipsDir, { recursive: true });
@@ -1248,7 +1318,9 @@ async function runDiagnostics({ fix = false } = {}) {
     try {
       const live = getVoiceConnection(gid);
       const status = conn?.state?.status ?? 'desconocido';
-      if (!live || ['destroyed', 'disconnected'].includes(status)) {
+      // Solo 'destroyed'/ausente es zombie. 'disconnected' lo gestiona el watchdog
+      // de 15s: matarlo aquí cortaría reconexiones válidas en curso.
+      if (!live || status === 'destroyed') {
         zombies++;
         if (fix) {
           try { conn?.destroy(); } catch { /* noop */ }

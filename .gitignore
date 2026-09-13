@@ -6,4 +6,5 @@ clips/*.pcm
 clips/*.mp3
 package-lock.zip
 *.log
+*.bak-*
 *:Zone.Identifier
