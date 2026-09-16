@@ -12,6 +12,7 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 - ⚙️ **Prefijo configurable** — `/prefix nuevo:!` por servidor (por defecto `c!`)
 - 💻 **Consola terminal** — `help · status · debug [fix] · logs [n] · update · save · guilds · restart · exit`
 - 📝 **Logs a archivo** — todo (`logs/bot-YYYY-MM-DD.log`, rotación 7 días): comandos, salidas del bot, estados de voz y errores
+- 🚨 **Aviso anti-kick** — si me echan de voz, DM al dueño del bot (`OWNER_ID`) y al dueño del servidor diciendo quién lo hizo (vía auditoría)
 - 🔄 **Auto-update cada 20h** — desde GitHub (`git pull` si hay repo, clon fresco en hosting) + `npm install` si cambió `package.json` + restart
 - 🎨 **Embeds bonitos** en todos los mensajes
 
@@ -26,6 +27,7 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 | `c!lb`   | Top 10 de tiempo en llamada del servidor                     |
 | `c!clip` | MP3 con los últimos 2 min (cooldown 30s)                     |
 | `c!help` | Ayuda en embed                                               |
+| `c!bot_logs` | Historial completo en .txt (quién entró/salió, sonidos, movimientos del bot y quién lo echó) |
 | `/prefix`| Ver o cambiar el prefijo (requiere Gestionar servidor)       |
 
 > El slash `/prefix` es global y puede tardar hasta 1h en propagar la primera vez. Como fallback existe `c!prefix` en texto.
@@ -52,6 +54,7 @@ DISCORD_TOKEN=tu_token
 # UPDATE_REPO=DiosHorus/infinite-bot
 # UPDATE_BRANCH=main
 # NO_AUTO_UPDATE=1   (desactiva el auto-update)
+# OWNER_ID=tu_id_discord (dueño del bot: usa iadmin!update y recibe DM si echan al bot de voz)
 ```
 
 ## ☁️ Hosting (sin `.git`)

@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits, AuditLogEvent } = require('discord.js');
 const { joinVoiceChannel, getVoiceConnection, EndBehaviorType, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType, VoiceConnectionStatus } = require('@discordjs/voice');
 const fs = require('fs');
 const fsp = require('fs/promises');
@@ -127,6 +127,77 @@ function getRecentEvents(guildId, windowMs = LOG_WINDOW_MS) {
   const arr = eventLogs.get(guildId) || [];
   const cutoff = Date.now() - windowMs;
   return arr.filter(e => e.t >= cutoff);
+}
+
+// --- Salidas previstas del bot (leave, cambio de canal, limpiezas): no son kicks ---
+// Se marca ANTES de destruir la conexión a propósito; el voiceStateUpdate que
+// llega después la consume y NO manda DM. Caduca en 15s para no tapar un kick real.
+const expectedBotLeave = new Set();
+function markExpectedLeave(guildId) {
+  expectedBotLeave.add(guildId);
+  setTimeout(() => expectedBotLeave.delete(guildId), 15000).unref();
+}
+
+// Busca en la auditoría quién desconectó al bot de voz (requiere permiso
+// "Ver registro de auditoría"). Devuelve el executor o null si no hay rastro.
+async function findVoiceKicker(guild, channelId) {
+  try {
+    const me = client.user?.id;
+    if (!me || !guild?.fetchAuditLogs) return null;
+    // Pequeña espera: la entrada de auditoría a veces llega ~1-2s después del evento
+    await new Promise(r => setTimeout(r, 2000));
+    const logs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberDisconnect, limit: 5 });
+    const now = Date.now();
+    for (const entry of logs.entries.values()) {
+      if (entry.target?.id !== me) continue;
+      if (now - entry.createdTimestamp > 25000) continue;
+      const entryChannelId = entry.extra?.channel?.id ?? entry.extra?.channelId ?? null;
+      if (channelId && entryChannelId && entryChannelId !== channelId) continue;
+      if (entry.executor && entry.executor.id !== me) return entry.executor;
+    }
+  } catch (e) {
+    console.warn(`[voz] no pude leer audit logs en guild ${guild?.id}:`, e.message);
+  }
+  return null;
+}
+
+// Avisa por DM al dueño del bot (OWNER_ID) y al dueño del servidor cuando
+// echan al bot de voz, indicando quién lo hizo. Registra el evento para bot_logs.
+async function notifyBotKicked(guild, { channelName, kicker } = {}) {
+  const gid = guild.id;
+  const kickerTxt = kicker ? `${kicker.tag ?? kicker.username ?? 'Desconocido'} (${kicker.id})` : 'desconocido (me falta permiso "Ver registro de auditoría" o fue una desconexión)';
+  logEvent(gid, 'bot_kicked', kicker?.id ?? '???', kicker?.username ?? kicker?.tag ?? 'Desconocido', `me echó de ${channelName ?? 'voz'} en ${guild.name}`);
+  console.warn(`[voz] BOT echado en guild ${gid} (${guild.name}) canal=${channelName ?? '?'} por=${kickerTxt}`);
+  const msg = `🚨 Me echaron de voz en **${guild.name}** (canal **${channelName ?? 'desconocido'}**).\nQuién me echó: **${kickerTxt}**\nHora: <t:${Math.floor(Date.now() / 1000)}:F>\nVuelve a meterme con \`join\` cuando quieras.`;
+  const targets = new Set();
+  const botOwner = (process.env.OWNER_ID || '').trim();
+  if (botOwner) targets.add(botOwner);
+  else console.warn('[voz] sin OWNER_ID configurado: el aviso solo va al owner del servidor.');
+  if (guild.ownerId) targets.add(guild.ownerId);
+  for (const uid of targets) {
+    try {
+      const u = await client.users.fetch(uid);
+      await u.send(msg);
+    } catch (e) {
+      console.warn(`[voz] no pude mandar DM de kick a ${uid}:`, e.message);
+    }
+  }
+}
+
+const BOT_LOG_LABELS = {
+  join: '🟢 entró al canal', leave: '🔴 salió del canal',
+  mute: '🔇 se muteó', unmute: '🔈 se desmuteó',
+  stream_start: '📡 inició pantalla', stream_end: '📴 terminó pantalla',
+  video_start: '📹 inició cámara', video_end: '📹 terminó cámara',
+  sound: '🔊 sonido', bot_join: '🤖 BOT se unió', bot_leave: '🤖 BOT salió (previsto)',
+  bot_moved: '🔀 BOT movido', bot_kicked: '🚨 BOT echado'
+};
+function formatBotLogLine(e) {
+  const ts = new Date(e.t).toLocaleString('es-ES', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const label = BOT_LOG_LABELS[e.type] ?? e.type;
+  const who = `${e.username} (${e.userId})`;
+  const extra = [e.detail, e.sound ? `[${e.sound}]` : ''].filter(Boolean).join(' ');
+  return `[${ts}] ${label} — ${who}${extra ? ` — ${extra}` : ''}`;
 }
 
 function getGuildPlayer(guildId, connection) {
@@ -268,6 +339,7 @@ function getLiveConnection(guildId) {
     if (stored) {
       console.warn(`[voz] conexión zombie en guild ${guildId} (destroyed), congelo tiempos y limpio mapa`);
       finalizeGuildTimes(guildId);
+      markExpectedLeave(guildId);
       try { stored.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
       isRecording.set(guildId, false);
@@ -280,6 +352,7 @@ function getLiveConnection(guildId) {
   if (!live && stored) {
     console.warn(`[voz] conexión fantasma en guild ${guildId} (sin getVoiceConnection), congelo tiempos y limpio para reconectar`);
     finalizeGuildTimes(guildId);
+    markExpectedLeave(guildId);
     try { stored.destroy(); } catch { /* noop */ }
     callConnections.delete(guildId);
     isRecording.set(guildId, false);
@@ -310,6 +383,7 @@ function attachConnectionHandlers(connection, guildId) {
         if (!cur || st === VoiceConnectionStatus.Destroyed || st === VoiceConnectionStatus.Disconnected) {
           console.error(`[voz] guild ${guildId}: no se recuperó (status=${st ?? 'none'}), congelo tiempos y limpio`);
           finalizeGuildTimes(guildId);
+          markExpectedLeave(guildId);
           try { cur?.destroy(); } catch { /* noop */ }
           try { connection.destroy(); } catch { /* noop */ }
           callConnections.delete(guildId);
@@ -448,6 +522,7 @@ client.on('messageCreate', async message => {
 
       // Si estaba en otro canal del mismo guild, salir antes
       const old = getVoiceConnection(guildId) ?? callConnections.get(guildId);
+      if (old) markExpectedLeave(guildId);
       try { old?.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
 
@@ -482,6 +557,7 @@ client.on('messageCreate', async message => {
           }
         });
         saveData();
+        logEvent(guildId, 'bot_join', client.user.id, client.user?.username ?? 'bot', `me uní a ${voiceChannel.name} por ${message.author.tag}`);
 
         return message.reply({ embeds: [embedOk(message, 'Me uní', `Estoy en **${voiceChannel.name}**.\nUsa \`${prefix}start\` para grabar · \`${prefix}leave\` para que salga.`)] });
       } catch (error) {
@@ -496,10 +572,12 @@ client.on('messageCreate', async message => {
       if (!conn) return message.reply({ embeds: [embedInfo(message, '👋 Nada que hacer', 'No estoy en ningún canal de voz.')] });
       console.log(`[cmd] leave guild=${guildId} por=${message.author.tag}`);
       finalizeGuildTimes(guildId);
+      markExpectedLeave(guildId);
       try { conn.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
       isRecording.set(guildId, false);
       saveData();
+      logEvent(guildId, 'bot_leave', client.user.id, client.user?.username ?? 'bot', `salida con leave por ${message.author.tag}`);
       return message.reply({ embeds: [embedOk(message, 'Me fui', `Tiempos guardados. Usa \`${prefix}join\` cuando quieras que vuelva.`)] });
     }
 
@@ -696,6 +774,7 @@ client.on('messageCreate', async message => {
           callConnections.set(message.guild.id, connection);
           setupAudioReceiver(connection, message.guild.id);
           attachConnectionHandlers(connection, message.guild.id);
+          logEvent(message.guild.id, 'bot_join', client.user.id, client.user?.username ?? 'bot', `auto-join a ${message.member.voice.channel.name} por sonido de ${message.author.tag}`);
         } catch (e) {
           console.error('Error al unirse para sonido:', e.message);
           return message.reply({ embeds: [embedErr(message, 'No pude unirme', 'Revisa permisos de Conectar/Hablar.')] });
@@ -773,6 +852,34 @@ client.on('messageCreate', async message => {
       return message.reply({ embeds: [embed] });
     }
 
+    if (cmd === 'bot_logs' || cmd === 'botlogs' || cmd === 'bot-logs') {
+      const guildId = message.guild.id;
+      const all = eventLogs.get(guildId) || [];
+      if (all.length === 0) {
+        return message.reply({ embeds: [embedInfo(message, '🤖 Bot logs', 'Sin actividad registrada todavía (me uno con `join` y todo movimiento queda aquí).')] });
+      }
+      const counts = {};
+      for (const e of all) counts[e.type] = (counts[e.type] ?? 0) + 1;
+      const summary = Object.entries(counts).map(([t, n]) => `\`${t}\`: ${n}`).join(' · ');
+      const header = `🤖 Bot logs — ${message.guild.name}\n${all.length} eventos (ventana ~${Math.round(LOG_KEEP_MS / 60000)} min, máx 2000)\n${new Date().toISOString()}\n\n`;
+      const body = all.map(formatBotLogLine).join('\n');
+      const stamp = Date.now();
+      const filePath = path.join(require('os').tmpdir(), `botlogs-${guildId}-${stamp}.txt`);
+      try {
+        await fsp.writeFile(filePath, header + body, 'utf8');
+        const embed = embedBase(message)
+          .setTitle('🤖 Bot logs — historial completo')
+          .setDescription(`**${all.length} eventos**: ${summary}\n\nIncluye entradas/salidas (quién), muteos, transmisiones, sonidos y movimientos del propio bot (uniones, salidas previstas y expulsiones con su responsable).`);
+        await message.reply({ embeds: [embed], files: [{ attachment: filePath, name: `botlogs-${stamp}.txt` }] });
+      } catch (e) {
+        console.error('Error generando bot_logs:', e.message);
+        await message.reply({ embeds: [embedErr(message, 'No pude generar los logs', 'Inténtalo de nuevo en unos segundos.')] });
+      } finally {
+        await fsp.unlink(filePath).catch(() => {});
+      }
+      return;
+    }
+
     if (cmd === 'help') {
       const embed = new EmbedBuilder()
         .setColor(0x5865F2)
@@ -787,6 +894,7 @@ client.on('messageCreate', async message => {
           { name: `✂️ \`${prefix}clip\``, value: `Genera un MP3 con los últimos ${CLIP_SECONDS / 60} min (cooldown 30s).`, inline: false },
           { name: `🔊 \`${prefix}s <nombre>\``, value: `Reproduce un sonido de \`sounds/\`. Lista con \`${prefix}sounds\`.`, inline: false },
           { name: `📋 \`${prefix}logs\``, value: 'Resumen de los últimos 15 min: entradas/salidas, muteos, transmisiones y sonidos (agregados anti-spam).', inline: false },
+          { name: `🤖 \`${prefix}bot_logs\``, value: 'Historial completo en .txt: quién entró/salió, muteos, sonidos y movimientos del bot (incluye quién me echó).', inline: false },
           { name: '⚙️ `/prefix`', value: 'Ver o cambiar el prefijo (requiere Gestionar servidor).', inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
@@ -884,18 +992,39 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   // Cambios de voz del propio bot: se registran SIEMPRE en el log para saber por qué se salió
   if (newState.member?.user.id === client.user?.id) {
     const gid = newState.guild.id;
+    const guild = newState.guild ?? oldState.guild;
     if (newState.channelId == null) {
-      console.warn(`[voz] BOT salió/desconectado en guild ${gid} (estaba en ${oldState.channelId ?? '???'}). Congelo tiempos y limpio.`);
+      const wasExpected = expectedBotLeave.has(gid);
+      if (wasExpected) expectedBotLeave.delete(gid);
+      const channelName = oldState.channel?.name ?? null;
+      const oldChannelId = oldState.channelId ?? null;
+      console.warn(`[voz] BOT salió/desconectado en guild ${gid} (estaba en ${oldChannelId ?? '???'}). Congelo tiempos y limpio.`);
       finalizeGuildTimes(gid);
       try { getVoiceConnection(gid)?.destroy(); } catch { /* noop */ }
       callConnections.delete(gid);
       isRecording.set(gid, false);
       saveData();
+      if (wasExpected) {
+        logEvent(gid, 'bot_leave', client.user.id, client.user?.username ?? 'bot', `salida prevista de ${channelName ?? 'voz'}`);
+      } else {
+        // Posible kick/expulsión: se busca al responsable en auditoría y se
+        // avisa por DM al dueño del bot y al del servidor (no bloquea el evento).
+        (async () => {
+          try {
+            const kicker = await findVoiceKicker(guild, oldChannelId);
+            await notifyBotKicked(guild, { channelName, kicker });
+          } catch (e) {
+            console.error(`[voz] fallo avisando kick en guild ${gid}:`, e.message);
+          }
+        })();
+      }
     } else if (oldState.channelId !== newState.channelId) {
       console.log(`[voz] BOT movido en guild ${gid}: ${oldState.channelId ?? '???'} -> ${newState.channelId}. Re-engancho al canal nuevo.`);
+      logEvent(gid, 'bot_moved', client.user.id, client.user?.username ?? 'bot', `${oldState.channel?.name ?? oldState.channelId ?? '?'} -> ${newState.channel?.name ?? newState.channelId}`);
       // Si no se re-hace la conexión, joinConfig queda con el canal viejo y el
       // trackeo muere en silencio (compara contra un canal vacío).
       try {
+        markExpectedLeave(gid);
         try { getVoiceConnection(gid)?.destroy(); } catch { /* noop */ }
         callConnections.delete(gid);
         const conn = joinVoiceChannel({
