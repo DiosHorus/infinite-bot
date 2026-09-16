@@ -58,6 +58,8 @@ const callConnections = new Map();
 const audioStreams = new Map(); // key `${guildId}:${userId}`
 // guildId -> timestamp ultimo clip
 const clipCooldown = new Map();
+// guildId con clip en curso (evita picos de memoria por clips paralelos)
+const clipBusy = new Set();
 
 // --- Event Logs (ultimos 15 min): entradas/salidas, muteos, transmisiones, sonidos ---
 const LOG_WINDOW_MS = 15 * 60 * 1000;
@@ -398,13 +400,20 @@ client.on('messageCreate', async message => {
     if (!message.guild || !message.member) return; // ignora DMs
 
     const prefix = getPrefix(message.guild.id);
-    const content = message.content.toLowerCase().trim();
+    const rawTrimmed = message.content.trim();
+    const content = rawTrimmed.toLowerCase();
 
     // Comando secreto de dueño: fijo, /prefix NO lo modifica.
+    // Fail-closed: solo el OWNER_ID configurado puede usarlo. Sin OWNER_ID
+    // no se autoriza a nadie (antes caía a guild.ownerId y cualquier owner
+    // de servidor podía forzar update+restart).
     if (content === 'iadmin!update') {
       const cfgOwner = (process.env.OWNER_ID || '').trim();
-      const isOwner = (cfgOwner && message.author.id === cfgOwner) || message.author.id === message.guild.ownerId;
-      if (!isOwner) {
+      if (!cfgOwner) {
+        console.log(`[iadmin] bloqueado (sin OWNER_ID configurado): ${message.author.tag} (${message.author.id})`);
+        return; // silencioso para no revelar el comando
+      }
+      if (message.author.id !== cfgOwner) {
         console.log(`[iadmin] intento bloqueado de ${message.author.tag} (${message.author.id})`);
         return; // silencioso para no revelar el comando
       }
@@ -419,7 +428,11 @@ client.on('messageCreate', async message => {
     }
 
     if (!content.startsWith(prefix.toLowerCase())) return;
+    // `cmd` en minúsculas para comparar el comando; `cmdRaw` conserva el
+    // texto original para los argumentos (antes todo se aplanaba con
+    // toLowerCase y los args quedaban acoplados al matching).
     const cmd = content.slice(prefix.length).trim();
+    const cmdRaw = rawTrimmed.slice(prefix.length).trim();
 
     if (cmd === 'join') {
       if (!message.member.voice.channel) {
@@ -584,14 +597,28 @@ client.on('messageCreate', async message => {
         return message.reply({ embeds: [embedBase(message, EMBED_WARN).setTitle('⏳ Cooldown').setDescription(`Espera **${wait}s** antes de pedir otro clip.`)] });
       }
       // El cooldown se marca SOLO si el clip se entrega (si falla, reintento libre).
+      if (clipBusy.has(guildId)) {
+        return message.reply({ embeds: [embedBase(message, EMBED_WARN).setTitle('⏳ Ya estoy generando un clip').setDescription('Espera a que termine el clip en curso.')] });
+      }
+      clipBusy.add(guildId);
 
       const stamp = Date.now();
       const tempPath = path.join(clipsDir, `temp_${guildId}_${stamp}.pcm`);
       const clipPath = path.join(clipsDir, `clip_${guildId}_${stamp}.mp3`);
 
       try {
-        const audioBuffer = Buffer.concat(buf.chunks);
-        await fsp.writeFile(tempPath, audioBuffer);
+        // Snapshot + escritura por streaming: evita Buffer.concat(~23MB) que
+        // duplicaba el buffer en memoria por cada clip.
+        const chunks = buf.chunks.slice();
+        if (chunks.length === 0) {
+          return message.reply({ embeds: [embedInfo(message, '✂️ Sin audio todavía', 'El buffer se vació. Deja que alguien hable.')] });
+        }
+        const handle = await fsp.open(tempPath, 'w');
+        try {
+          for (const chunk of chunks) await handle.write(chunk);
+        } finally {
+          await handle.close();
+        }
 
         try {
           await execFileAsync('ffmpeg', [
@@ -621,6 +648,7 @@ client.on('messageCreate', async message => {
         console.error('Error al generar clip:', error);
         await message.reply({ embeds: [embedErr(message, 'No pude generar el clip', 'Inténtalo de nuevo en unos segundos.')] });
       } finally {
+        clipBusy.delete(guildId);
         await fsp.unlink(tempPath).catch(() => {});
         await fsp.unlink(clipPath).catch(() => {});
       }
@@ -638,8 +666,8 @@ client.on('messageCreate', async message => {
     if (cmd === 's' || cmd === 'sound' || cmd.startsWith('s ') || cmd.startsWith('sound ')) {
       let name = '';
       if (cmd === 's' || cmd === 'sound') name = '';
-      else if (cmd.startsWith('s ')) name = cmd.slice(2).trim();
-      else if (cmd.startsWith('sound ')) name = cmd.slice(6).trim();
+      else if (cmd.startsWith('s ')) name = cmdRaw.slice(2).trim();
+      else if (cmd.startsWith('sound ')) name = cmdRaw.slice(6).trim();
       if (!name) {
         return message.reply({ embeds: [embedInfo(message, '🔊 Sonido', `Uso: \`${prefix}s <nombre>\`\nLista: \`${prefix}sounds\``)] });
       }
