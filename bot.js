@@ -137,6 +137,9 @@ function markExpectedLeave(guildId) {
   expectedBotLeave.add(guildId);
   setTimeout(() => expectedBotLeave.delete(guildId), 15000).unref();
 }
+// Antibucle del re-enganche: si acabamos de re-enganchar (<5s), se ignoran
+// movimientos repetidos para no entrar en entra/sale infinito.
+const botReengageAt = new Map();
 
 // Busca en la auditoría quién desconectó al bot de voz (requiere permiso
 // "Ver registro de auditoría"). Devuelve el executor o null si no hay rastro.
@@ -1018,7 +1021,16 @@ client.on('voiceStateUpdate', (oldState, newState) => {
           }
         })();
       }
-    } else if (oldState.channelId !== newState.channelId) {
+    // Solo es "movido" si estaba EN un canal y aparece EN otro distinto.
+    // El null -> canal es el join inicial (la conexión ya existe, no hay nada
+    // que re-enganchar: antes se destruía y reconectaba solo, en bucle entra/sale).
+    } else if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
+      const lastRe = botReengageAt.get(gid) ?? 0;
+      if (Date.now() - lastRe < 5000) {
+        console.log(`[voz] BOT movimiento repetido en guild ${gid}, ignoro (antibucle).`);
+        return;
+      }
+      botReengageAt.set(gid, Date.now());
       console.log(`[voz] BOT movido en guild ${gid}: ${oldState.channelId ?? '???'} -> ${newState.channelId}. Re-engancho al canal nuevo.`);
       logEvent(gid, 'bot_moved', client.user.id, client.user?.username ?? 'bot', `${oldState.channel?.name ?? oldState.channelId ?? '?'} -> ${newState.channel?.name ?? newState.channelId}`);
       // Si no se re-hace la conexión, joinConfig queda con el canal viejo y el
