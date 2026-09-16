@@ -39,6 +39,7 @@ const MAX_BYTES = 48000 * 2 * 2 * CLIP_SECONDS;
 const CLIP_COOLDOWN_MS = 30 * 1000;
 const DATA_FILE = path.join(__dirname, 'timeData.json');
 const PREFIX_FILE = path.join(__dirname, 'prefixes.json');
+const ADMIN_FILE = path.join(__dirname, 'admins.json');
 const DEFAULT_PREFIX = 'c!';
 
 // --- Auto-update (GitHub, cada 20h) ---
@@ -261,6 +262,45 @@ function savePrefixes() {
   }
 }
 
+// --- Admins del bot por servidor (pueden sacarme con leave y gestionar admins) ---
+// Admins por defecto, sin configurar nada: el dueño del servidor y el dueño
+// del bot (OWNER_ID). Los extra se guardan en admins.json vía /addadmin.
+const botAdmins = new Map(); // guildId -> Set(userId)
+function botOwnerId() {
+  return (process.env.OWNER_ID || '').trim();
+}
+function getAdminSet(guildId) {
+  if (!botAdmins.has(guildId)) botAdmins.set(guildId, new Set());
+  return botAdmins.get(guildId);
+}
+function isBotAdmin(guild, userId) {
+  if (!userId) return false;
+  if (userId === botOwnerId() && botOwnerId()) return true;
+  if (guild?.ownerId && userId === guild.ownerId) return true;
+  return getAdminSet(guild?.id).has(userId);
+}
+function loadAdmins() {
+  try {
+    if (!fs.existsSync(ADMIN_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(ADMIN_FILE, 'utf8'));
+    for (const [g, arr] of Object.entries(raw)) {
+      if (Array.isArray(arr)) botAdmins.set(g, new Set(arr.filter(id => typeof id === 'string')));
+    }
+    console.log('Admins cargados.');
+  } catch (e) {
+    console.error('No se pudo cargar admins.json:', e.message);
+  }
+}
+function saveAdmins() {
+  try {
+    const out = {};
+    for (const [g, set] of botAdmins.entries()) out[g] = [...set];
+    fs.writeFileSync(ADMIN_FILE, JSON.stringify(out, null, 2));
+  } catch (e) {
+    console.error('No se pudo guardar admins.json:', e.message);
+  }
+}
+
 function getGuildTimes(guildId) {
   if (!timeInCall.has(guildId)) timeInCall.set(guildId, new Map());
   return timeInCall.get(guildId);
@@ -320,6 +360,7 @@ function saveData() {
 
 loadData();
 loadPrefixes();
+loadAdmins();
 setInterval(saveData, 5 * 60 * 1000).unref();
 
 function formatDuration(ms) {
@@ -431,23 +472,69 @@ function embedInfo(message, title, desc) {
 
 client.once('ready', async () => {
   console.log(`Bot listo como ${client.user.tag}!`);
-  // Registra /prefix global (tarda hasta 1h en propagar; en test usa un server y reinicia)
+  // Registra slash globales (tardan hasta 1h en propagar; en test usa un server y reinicia)
   try {
-    const cmd = new SlashCommandBuilder()
+    const cmdPrefix = new SlashCommandBuilder()
       .setName('prefix')
       .setDescription('Ver o cambiar el prefijo de comandos de este servidor')
       .addStringOption(o => o.setName('nuevo').setDescription('Nuevo prefijo (1-5 caracteres, sin espacios)').setRequired(false))
       .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+    const cmdAddAdmin = new SlashCommandBuilder()
+      .setName('addadmin')
+      .setDescription('Hacer a un usuario admin del bot (solo admins)')
+      .addUserOption(o => o.setName('usuario').setDescription('Usuario a hacer admin').setRequired(true));
+    const cmdRemoveAdmin = new SlashCommandBuilder()
+      .setName('removeadmin')
+      .setDescription('Quitar admin del bot a un usuario (solo admins)')
+      .addUserOption(o => o.setName('usuario').setDescription('Usuario a quitar admin').setRequired(true));
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    await rest.put(Routes.applicationCommands(client.user.id), { body: [cmd.toJSON()] });
-    console.log('Slash /prefix registrado.');
+    await rest.put(Routes.applicationCommands(client.user.id), { body: [cmdPrefix.toJSON(), cmdAddAdmin.toJSON(), cmdRemoveAdmin.toJSON()] });
+    console.log('Slash /prefix, /addadmin, /removeadmin registrados.');
   } catch (e) {
-    console.error('No se pudo registrar /prefix:', e.message);
+    console.error('No se pudo registrar slash:', e.message);
   }
 });
 
+async function handleAdminSlash(interaction, add) {
+  const guild = interaction.guild;
+  const guildId = interaction.guildId;
+  if (!guild || !guildId) return interaction.reply({ content: 'Solo funciona en servidores.', ephemeral: true });
+  if (!isBotAdmin(guild, interaction.user.id)) {
+    return interaction.reply({ content: '⛔ Solo un admin del bot puede hacer eso. Pide a un admin que te añada.', ephemeral: true });
+  }
+  const target = interaction.options.getUser('usuario', true);
+  if (target.bot) return interaction.reply({ content: 'No puedes hacer admin a un bot.', ephemeral: true });
+  if (target.id === guild.ownerId || target.id === botOwnerId()) {
+    return interaction.reply({ content: `**${target.tag}** ya es admin por defecto (dueño del ${target.id === guild.ownerId ? 'servidor' : 'bot'}).`, ephemeral: true });
+  }
+  const set = getAdminSet(guildId);
+  if (add) {
+    if (set.has(target.id)) return interaction.reply({ content: `**${target.tag}** ya era admin.`, ephemeral: true });
+    set.add(target.id);
+    saveAdmins();
+    console.log(`[admin] ${interaction.user.tag} hizo admin a ${target.tag} en guild ${guildId}`);
+    return interaction.reply({ content: `✅ **${target.tag}** ahora es admin del bot (puede sacarme con \`leave\` y gestionar admins).` });
+  } else {
+    if (!set.has(target.id)) return interaction.reply({ content: `**${target.tag}** no era admin.`, ephemeral: true });
+    set.delete(target.id);
+    saveAdmins();
+    console.log(`[admin] ${interaction.user.tag} quitó admin a ${target.tag} en guild ${guildId}`);
+    return interaction.reply({ content: `✅ **${target.tag}** ya no es admin del bot.` });
+  }
+}
+
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'prefix') return;
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName === 'addadmin' || interaction.commandName === 'removeadmin') {
+    try {
+      await handleAdminSlash(interaction, interaction.commandName === 'addadmin');
+    } catch (e) {
+      console.error(`Error en /${interaction.commandName}:`, e.message);
+      if (!interaction.replied) await interaction.reply({ content: 'Falló el comando.', ephemeral: true }).catch(() => {});
+    }
+    return;
+  }
+  if (interaction.commandName !== 'prefix') return;
   try {
     const guildId = interaction.guildId;
     if (!guildId) return interaction.reply({ content: 'Solo funciona en servidores.', ephemeral: true });
@@ -571,6 +658,9 @@ client.on('messageCreate', async message => {
 
     if (cmd === 'leave') {
       const guildId = message.guild.id;
+      if (!isBotAdmin(message.guild, message.author.id)) {
+        return message.reply({ embeds: [embedErr(message, 'Solo admins', `Solo un admin del bot puede sacarme.\nAdmins de este servidor: \`${prefix}admins\``)] });
+      }
       const conn = getLiveConnection(guildId);
       if (!conn) return message.reply({ embeds: [embedInfo(message, '👋 Nada que hacer', 'No estoy en ningún canal de voz.')] });
       console.log(`[cmd] leave guild=${guildId} por=${message.author.tag}`);
@@ -892,12 +982,14 @@ client.on('messageCreate', async message => {
           { name: `🔊 \`${prefix}join\``, value: 'Me uno a tu canal de voz.', inline: false },
           { name: `🔴 \`${prefix}start\``, value: 'Activa la grabación.', inline: false },
           { name: `⏸️ \`${prefix}stop\``, value: 'Pausa la grabación (el audio guardado sigue para clips).', inline: false },
-          { name: `👋 \`${prefix}leave\``, value: 'Guardo tiempos y salgo del canal.', inline: false },
+          { name: `👋 \`${prefix}leave\``, value: 'Guardo tiempos y salgo del canal (solo admins).', inline: false },
           { name: `🏆 \`${prefix}lb\``, value: 'Top 10 de tiempo en llamada de este servidor.', inline: false },
           { name: `✂️ \`${prefix}clip\``, value: `Genera un MP3 con los últimos ${CLIP_SECONDS / 60} min (cooldown 30s).`, inline: false },
           { name: `🔊 \`${prefix}s <nombre>\``, value: `Reproduce un sonido de \`sounds/\`. Lista con \`${prefix}sounds\`.`, inline: false },
           { name: `📋 \`${prefix}logs\``, value: 'Resumen de los últimos 15 min: entradas/salidas, muteos, transmisiones y sonidos (agregados anti-spam).', inline: false },
           { name: `🤖 \`${prefix}bot_logs\``, value: 'Historial completo en .txt: quién entró/salió, muteos, sonidos y movimientos del bot (incluye quién me echó).', inline: false },
+          { name: `🛡️ \`${prefix}admins\``, value: 'Ver admins del bot (por defecto: dueño del servidor y del bot).', inline: false },
+          { name: '➕ `/addadmin` · ➖ `/removeadmin`', value: 'Gestionar admins (solo admins). En texto: `addadmin @usuario`.', inline: false },
           { name: '⚙️ `/prefix`', value: 'Ver o cambiar el prefijo (requiere Gestionar servidor).', inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
@@ -907,6 +999,70 @@ client.on('messageCreate', async message => {
 
     if (cmd === 'prefix') {
       return message.reply({ embeds: [embedInfo(message, '⚙️ Prefijo', `Actual: \`${prefix}\`\nCámbialo con \`/prefix nuevo:!\` (requiere Gestionar servidor).`)] });
+    }
+
+    // Fallback en texto de /addadmin y /removeadmin (el slash global tarda
+    // hasta 1h en propagar). Uso: `<prefijo>addadmin @usuario` o con ID.
+    if (cmd.startsWith('addadmin') || cmd.startsWith('removeadmin')) {
+      const adding = cmd.startsWith('addadmin');
+      if (!isBotAdmin(message.guild, message.author.id)) {
+        return message.reply({ embeds: [embedErr(message, 'Solo admins', 'Solo un admin del bot puede gestionar admins.')] });
+      }
+      const mentioned = message.mentions?.users?.first?.();
+      const idMatch = cmdRaw.match(/(\d{15,25})/);
+      const targetId = mentioned?.id ?? idMatch?.[1] ?? null;
+      if (!targetId) {
+        return message.reply({ embeds: [embedInfo(message, adding ? '➕ AddAdmin' : '➖ RemoveAdmin', `Uso: \`${prefix}${adding ? 'addadmin' : 'removeadmin'} @usuario\` (o su ID).`)] });
+      }
+      let targetTag = targetId;
+      try {
+        const m = await message.guild.members.fetch(targetId);
+        if (m.user.bot) return message.reply({ embeds: [embedErr(message, 'No válido', 'No puedes hacer admin a un bot.')] });
+        targetTag = m.user.tag;
+      } catch {
+        return message.reply({ embeds: [embedErr(message, 'No lo encuentro', `Nadie con ID \`${targetId}\` en este servidor.`)] });
+      }
+      if (targetId === message.guild.ownerId || targetId === botOwnerId()) {
+        return message.reply({ embeds: [embedInfo(message, 'Ya es admin', `**${targetTag}** es admin por defecto (dueño del ${targetId === message.guild.ownerId ? 'servidor' : 'bot'}): no se puede ${adding ? 'añadir' : 'quitar'}.`)] });
+      }
+      const set = getAdminSet(message.guild.id);
+      if (adding) {
+        if (set.has(targetId)) return message.reply({ embeds: [embedInfo(message, '➕ AddAdmin', `**${targetTag}** ya era admin.`)] });
+        set.add(targetId);
+        saveAdmins();
+        console.log(`[admin] ${message.author.tag} hizo admin a ${targetTag} en guild ${message.guild.id} (texto)`);
+        return message.reply({ embeds: [embedOk(message, 'Admin añadido', `**${targetTag}** ahora es admin del bot (puede sacarme con \`${prefix}leave\`).`)] });
+      } else {
+        if (!set.has(targetId)) return message.reply({ embeds: [embedInfo(message, '➖ RemoveAdmin', `**${targetTag}** no era admin.`)] });
+        set.delete(targetId);
+        saveAdmins();
+        console.log(`[admin] ${message.author.tag} quitó admin a ${targetTag} en guild ${message.guild.id} (texto)`);
+        return message.reply({ embeds: [embedOk(message, 'Admin quitado', `**${targetTag}** ya no es admin del bot.`)] });
+      }
+    }
+
+    if (cmd === 'admins') {
+      const guildId = message.guild.id;
+      const lines = [];
+      const ownerId = message.guild.ownerId;
+      let ownerTag = ownerId;
+      try { ownerTag = (await message.guild.members.fetch(ownerId)).user.tag; } catch { /* noop */ }
+      lines.push(`👑 Dueño del servidor: **${ownerTag}**`);
+      const bOwner = botOwnerId();
+      lines.push(bOwner ? `🤖 Dueño del bot: <@${bOwner}>` : '🤖 Dueño del bot: _(sin OWNER_ID configurado)_');
+      const extras = [...getAdminSet(guildId)];
+      if (extras.length === 0) {
+        lines.push('_Sin admins extra. Añade con `/addadmin` o `'
+          + prefix + 'addadmin @usuario`._');
+      } else {
+        lines.push(`**Admins extra (${extras.length}):**`);
+        for (const id of extras) {
+          let tag = id;
+          try { tag = (await message.guild.members.fetch(id)).user.tag; } catch { tag = `${id} (fuera del servidor)`; }
+          lines.push(`• **${tag}**`);
+        }
+      }
+      return message.reply({ embeds: [embedBase(message).setTitle('🛡️ Admins del bot').setDescription(lines.join('\n'))] });
     }
   } catch (err) {
     console.error('Error en messageCreate:', err);
@@ -1215,7 +1371,7 @@ async function getRemoteSha() {
 }
 
 // Archivos/carpetas que NUNCA se pisan en el hosting
-const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'sounds', 'logs', 'timeData.json', 'prefixes.json', '.version']);
+const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'sounds', 'logs', 'timeData.json', 'prefixes.json', 'admins.json', '.version']);
 
 async function copyFreshUpdate(srcDir) {
   const entries = await fsp.readdir(srcDir, { withFileTypes: true });
@@ -1440,7 +1596,8 @@ async function runDiagnostics({ fix = false } = {}) {
   // 7-8) JSONs corruptos -> backup + reset (solo con fix)
   for (const [label, file, loader] of [
     ['tiempos', DATA_FILE, loadData],
-    ['prefijos', PREFIX_FILE, loadPrefixes]
+    ['prefijos', PREFIX_FILE, loadPrefixes],
+    ['admins', ADMIN_FILE, loadAdmins]
   ]) {
     try {
       if (fs.existsSync(file)) JSON.parse(fs.readFileSync(file, 'utf8'));

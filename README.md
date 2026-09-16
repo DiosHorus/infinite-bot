@@ -23,12 +23,15 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 | `c!join` | Me uno a tu canal de voz                                     |
 | `c!start`| Activa la grabación                                          |
 | `c!stop` | Pausa la grabación (el audio guardado sigue para clips)      |
-| `c!leave`| Guardo tiempos y salgo del canal                             |
+| `c!leave`| Guardo tiempos y salgo del canal (solo admins)              |
 | `c!lb`   | Top 10 de tiempo en llamada del servidor                     |
 | `c!clip` | MP3 con los últimos 2 min (cooldown 30s)                     |
 | `c!help` | Ayuda en embed                                               |
 | `c!bot_logs` | Historial completo en .txt (quién entró/salió, sonidos, movimientos del bot y quién lo echó) |
 | `/prefix`| Ver o cambiar el prefijo (requiere Gestionar servidor)       |
+| `/addadmin`| Hacer admin del bot a un usuario (solo admins)               |
+| `/removeadmin`| Quitar admin del bot (solo admins, no a dueños)           |
+| `c!admins` | Ver admins del bot (por defecto: dueño del server + dueño del bot) |
 
 > El slash `/prefix` es global y puede tardar hasta 1h en propagar la primera vez. Como fallback existe `c!prefix` en texto.
 
