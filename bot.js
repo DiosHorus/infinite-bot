@@ -328,7 +328,7 @@ function botCanSend(channel) {
   } catch { return false; }
 }
 // Canal donde se mandan los summons: el configurado, si no el del sistema,
-// si no el primer canal de texto escribible.
+// si no el primer canal de texto escribible (hilos no: los webhooks no van).
 function resolvePanicChannel(guild) {
   const cfg = getPanic(guild.id);
   if (cfg.channelId) {
@@ -337,8 +337,42 @@ function resolvePanicChannel(guild) {
   }
   const sys = guild.systemChannelId ? guild.channels.cache.get(guild.systemChannelId) : null;
   if (botCanSend(sys)) return sys;
-  const sorted = [...guild.channels.cache.values()].filter(botCanSend).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  const sorted = [...guild.channels.cache.values()].filter(c => botCanSend(c) && !c.isThread?.()).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
   return sorted[0] ?? null;
+}
+const PANIC_WEBHOOK_NAME = 'Infinity Panic';
+// Webhook propio del canal para camuflar los summons (no salen a nombre del
+// bot). Requiere permiso Gestionar webhooks; si falla, se usa mensaje normal.
+async function getPanicWebhook(channel) {
+  try {
+    const hooks = await channel.fetchWebhooks();
+    const mine = hooks.find(w => w.owner?.id === client.user.id && w.name === PANIC_WEBHOOK_NAME);
+    if (mine) return mine;
+    return await channel.createWebhook({ name: PANIC_WEBHOOK_NAME, avatar: client.user.displayAvatarURL({ extension: 'png', size: 64 }) });
+  } catch (e) {
+    console.warn(`[panic] sin webhook en #${channel.name ?? channel.id}:`, e.message);
+    return null;
+  }
+}
+// Manda un summon: primero vía webhook (camuflado), si no mensaje del bot.
+// Devuelve 'webhook' | 'bot' | null (falló).
+async function sendSummon(channel, text) {
+  const hook = await getPanicWebhook(channel);
+  if (hook) {
+    try {
+      await hook.send({ content: text, username: PANIC_WEBHOOK_NAME });
+      return 'webhook';
+    } catch (e) {
+      console.warn(`[panic] webhook falló, pruebo mensaje normal:`, e.message);
+    }
+  }
+  try {
+    await channel.send(text);
+    return 'bot';
+  } catch (e) {
+    console.error(`[panic] no pude mandar '${text}':`, e.message);
+    return null;
+  }
 }
 // PUNTO DE ENGANCHE 2 — panic mode: infinity reentra + summons a otros bots + DM.
 async function enterPanicMode(guild, info = {}) {
@@ -363,21 +397,18 @@ async function enterPanicMode(guild, info = {}) {
   // 2) Summons: comandos de join de otros bots en el chat
   const channel = resolvePanicChannel(guild);
   let sentCount = 0;
+  let via = 'bot';
   if (!channel) {
     console.error(`[panic] guild ${gid}: sin canal de texto donde mandar summons (¿sin permiso de Enviar mensajes?).`);
   } else {
     for (const text of cfg.summons) {
-      try {
-        await channel.send(text);
-        sentCount++;
-        logEvent(gid, 'panic', client.user.id, client.user?.username ?? 'bot', `summon '${text}' en #${channel.name ?? channel.id}`);
-      } catch (e) {
-        console.error(`[panic] guild ${gid}: no pude mandar '${text}':`, e.message);
-      }
+      const how = await sendSummon(channel, text);
+      if (how) { sentCount++; via = how; logEvent(gid, 'panic', client.user.id, client.user?.username ?? 'bot', `summon '${text}' en #${channel.name ?? channel.id} vía ${how}`); }
       await new Promise(r => setTimeout(r, PANIC_SUMMON_DELAY_MS));
     }
   }
-  await dmOwners(guild, `🆘 **PANIC MODE** en **${guild.name}** (me echaron x${info.streak ?? '?'} en 60s).\nInfinity: ${back ? 'de vuelta en voz ✅' : 'no pudo reentrar ❌'}\nRefuerzos: ${sentCount}/${cfg.summons.length} summons en ${channel ? `#${channel.name}` : 'ningún canal (sin permiso de Enviar mensajes)'}.\nRachas en \`bot> status\`.`);
+  const pasteBlock = cfg.summons.join('\n');
+  await dmOwners(guild, `🆘 **PANIC MODE** en **${guild.name}** (me echaron x${info.streak ?? '?'} en 60s).\nInfinity: ${back ? 'de vuelta en voz ✅' : 'no pudo reentrar ❌'}\nRefuerzos: ${sentCount}/${cfg.summons.length} summons en ${channel ? `#${channel.name}` : 'ningún canal (sin permiso de Enviar mensajes)'} (vía ${via}).\nSi los bots no entraron (ignoran mensajes no-humanos), pega esto en ${channel ? `#${channel.name}` : 'el chat'}:\n\`\`\`\n${pasteBlock}\n\`\`\`\nRachas en \`bot> status\`.`);
   return true;
 }
 // Respaldo por si el evento de salida se pierde: cada 5s comprueba que donde
@@ -1389,12 +1420,14 @@ client.on('messageCreate', async message => {
           return message.reply({ embeds: [embedErr(message, 'Sin canal', 'No tengo ningún canal de texto con permiso de Enviar mensajes.')] });
         }
         let n = 0;
+        let via = 'bot';
         for (const text of cfg.summons) {
-          try { await channel.send(text); n++; } catch (e) { console.error(`[panic] test: no pude mandar '${text}':`, e.message); }
+          const how = await sendSummon(channel, text);
+          if (how) { n++; via = how; }
           await new Promise(r => setTimeout(r, PANIC_SUMMON_DELAY_MS));
         }
-        logEvent(gid, 'panic', message.author.id, message.author.username, `test manual: ${n}/${cfg.summons.length} summons en #${channel.name ?? channel.id}`);
-        return message.reply({ embeds: [embedOk(message, 'Test panic', `Mandados **${n}/${cfg.summons.length}** summons en <#${channel.id}>. Mira si entraron los bots.`)] });
+        logEvent(gid, 'panic', message.author.id, message.author.username, `test manual: ${n}/${cfg.summons.length} summons en #${channel.name ?? channel.id} vía ${via}`);
+        return message.reply({ embeds: [embedOk(message, 'Test panic', `Mandados **${n}/${cfg.summons.length}** summons en <#${channel.id}> (vía ${via}). Mira si entraron los bots.`)] });
       }
       return showStatus();
     }
