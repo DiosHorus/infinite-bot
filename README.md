@@ -14,6 +14,7 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 - 📝 **Logs a archivo** — todo (`logs/bot-YYYY-MM-DD.log`, rotación 7 días): comandos, salidas del bot, estados de voz y errores
 - 🚨 **Aviso anti-kick** — si me echan de voz, DM al dueño del bot (`OWNER_ID`) y al dueño del servidor diciendo quién lo hizo (vía auditoría)
 - ↩️ **Rejoin anti-kick** — reentro al mismo canal a los 500ms; freno anti-bucle (5+ kicks en 60s → panic mode)
+- 🆘 **Panic mode** — con racha de kicks: reentro yo + mando en el chat los summons de otros bots (`!join`, `m!join`, `-join`, configurables con `panic`, solo admins)
 - 🔄 **Auto-update cada 20h** — desde GitHub (`git pull` si hay repo, clon fresco en hosting) + `npm install` si cambió `package.json` + restart
 - 🎨 **Embeds bonitos** en todos los mensajes
 
@@ -33,6 +34,7 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 | `/addadmin`| Hacer admin del bot a un usuario (solo admins)               |
 | `/removeadmin`| Quitar admin del bot (solo admins, no a dueños)           |
 | `c!admins` | Ver admins del bot (por defecto: dueño del server + dueño del bot) |
+| `c!panic` | Ver/configurar panic mode (summons + canal; cambios solo admins) |
 
 > El slash `/prefix` es global y puede tardar hasta 1h en propagar la primera vez. Como fallback existe `c!prefix` en texto.
 

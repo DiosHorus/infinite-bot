@@ -3,6 +3,7 @@ node_modules/
 timeData.json
 prefixes.json
 admins.json
+panic.json
 clips/*.pcm
 clips/*.mp3
 package-lock.zip

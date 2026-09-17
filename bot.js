@@ -229,6 +229,12 @@ async function rejoinAfterKick(guild, { channelId, channelName = null } = {}) {
     await enterPanicMode(guild, { reason: 'kick-loop', streak: st.count, channelId, channelName });
     return false;
   }
+  return doRejoin(guild, channelId, `${st.count} en 60s`);
+}
+// Núcleo del rejoin (lo usan el anti-kick y el panic mode): espera 500ms,
+// entra al canal, reconecta audio y retoma tiempos. Un solo intento.
+async function doRejoin(guild, channelId, note = '') {
+  const gid = guild.id;
   await new Promise(r => setTimeout(r, 500));
   try {
     const channel = guild.channels.cache.get(channelId) ?? await guild.channels.fetch(channelId).catch(() => null);
@@ -261,22 +267,116 @@ async function rejoinAfterKick(guild, { channelId, channelName = null } = {}) {
       else if (prev.startTime == null) { prev.startTime = t; times.set(member.user.id, prev); }
     });
     saveData();
-    logEvent(gid, 'bot_rejoin', client.user.id, client.user?.username ?? 'bot', `reentré a ${channel.name ?? channelId} 500ms tras el kick (${st.count} en 60s)`);
+    logEvent(gid, 'bot_rejoin', client.user.id, client.user?.username ?? 'bot', `reentré a ${channel.name ?? channelId} 500ms tras el kick${note ? ` (${note})` : ''}`);
     const rec = botExitWatch.get(gid);
     if (rec) rec.rejoined = true;
-    console.log(`[voz] guild ${gid}: reentré a ${channel.name ?? channelId} 500ms tras el kick.`);
+    console.log(`[voz] guild ${gid}: reentré a ${channel.name ?? channelId}${note ? ` (${note})` : ''}.`);
     return true;
   } catch (e) {
-    console.error(`[voz] guild ${gid}: no pude reentrar a ${channelName ?? channelId}:`, e.message);
+    console.error(`[voz] guild ${gid}: no pude reentrar a ${channelId}:`, e.message);
     return false;
   }
 }
-// PUNTO DE ENGANCHE 2 — panic mode (medidas pendientes: me dirás cuáles).
+// --- Panic mode: si nos echan en bucle, se traen refuerzos ---
+// Manda en un canal de texto los comandos de join de otros bots
+// (!join, m!join, -join...) para que entren, además de reentrar infinity.
+// Config por servidor en panic.json (comando `panic`, solo admins).
+const PANIC_FILE = path.join(__dirname, 'panic.json');
+const PANIC_SUMMON_DELAY_MS = 800;
+const PANIC_COOLDOWN_MS = 5 * 60 * 1000;
+const PANIC_MAX_SUMMONS = 10;
+const DEFAULT_SUMMONS = ['!join', 'm!join', '-join'];
+const panicCfg = new Map(); // guildId -> { enabled, channelId|null, summons[] }
+const panicAt = new Map(); // guildId -> último disparo
+function getPanic(guildId) {
+  if (!panicCfg.has(guildId)) panicCfg.set(guildId, { enabled: true, channelId: null, summons: [...DEFAULT_SUMMONS] });
+  return panicCfg.get(guildId);
+}
+function loadPanic() {
+  try {
+    if (!fs.existsSync(PANIC_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(PANIC_FILE, 'utf8'));
+    for (const [g, c] of Object.entries(raw)) {
+      if (!c || typeof c !== 'object') continue;
+      const summons = Array.isArray(c.summons)
+        ? c.summons.filter(s => typeof s === 'string' && s.trim().length >= 1 && s.trim().length <= 50).slice(0, PANIC_MAX_SUMMONS)
+        : [...DEFAULT_SUMMONS];
+      panicCfg.set(g, {
+        enabled: c.enabled !== false,
+        channelId: typeof c.channelId === 'string' ? c.channelId : null,
+        summons: summons.length ? summons : [...DEFAULT_SUMMONS]
+      });
+    }
+    console.log('Panic cargado.');
+  } catch (e) {
+    console.error('No se pudo cargar panic.json:', e.message);
+  }
+}
+function savePanic() {
+  try {
+    fs.writeFileSync(PANIC_FILE, JSON.stringify(Object.fromEntries(panicCfg), null, 2));
+  } catch (e) {
+    console.error('No se pudo guardar panic.json:', e.message);
+  }
+}
+function botCanSend(channel) {
+  try {
+    if (!channel?.isTextBased?.()) return false;
+    return !!channel.permissionsFor(client.user)?.has(PermissionFlagsBits.SendMessages);
+  } catch { return false; }
+}
+// Canal donde se mandan los summons: el configurado, si no el del sistema,
+// si no el primer canal de texto escribible.
+function resolvePanicChannel(guild) {
+  const cfg = getPanic(guild.id);
+  if (cfg.channelId) {
+    const c = guild.channels.cache.get(cfg.channelId);
+    if (botCanSend(c)) return c;
+  }
+  const sys = guild.systemChannelId ? guild.channels.cache.get(guild.systemChannelId) : null;
+  if (botCanSend(sys)) return sys;
+  const sorted = [...guild.channels.cache.values()].filter(botCanSend).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  return sorted[0] ?? null;
+}
+// PUNTO DE ENGANCHE 2 — panic mode: infinity reentra + summons a otros bots + DM.
 async function enterPanicMode(guild, info = {}) {
   const gid = guild.id;
-  console.warn(`[panic] guild ${gid} (${guild.name}): MODO PÁNICO por ${info.reason ?? '?'} (racha ${info.streak ?? '?'}). Medidas pendientes de definir.`);
+  const cfg = getPanic(gid);
   logEvent(gid, 'panic', client.user.id, client.user?.username ?? 'bot', `panic mode: ${info.reason ?? '?'} x${info.streak ?? '?'}`);
-  // TODO(panic-mode): aquí van tus medidas.
+  if (!cfg.enabled) {
+    console.warn(`[panic] guild ${gid}: panic desactivado, no hago nada.`);
+    return false;
+  }
+  const last = panicAt.get(gid) ?? 0;
+  if (Date.now() - last < PANIC_COOLDOWN_MS) {
+    console.log(`[panic] guild ${gid}: en cooldown, no re-disparo.`);
+    return false;
+  }
+  panicAt.set(gid, Date.now());
+  console.warn(`[panic] guild ${gid} (${guild.name}): MODO PÁNICO por ${info.reason ?? '?'} (racha ${info.streak ?? '?'})`);
+  // 1) Infinity entra también (un intento, sin contar racha)
+  let back = false;
+  if (info.channelId) back = await doRejoin(guild, info.channelId, 'panic mode');
+  await new Promise(r => setTimeout(r, 1000));
+  // 2) Summons: comandos de join de otros bots en el chat
+  const channel = resolvePanicChannel(guild);
+  let sentCount = 0;
+  if (!channel) {
+    console.error(`[panic] guild ${gid}: sin canal de texto donde mandar summons (¿sin permiso de Enviar mensajes?).`);
+  } else {
+    for (const text of cfg.summons) {
+      try {
+        await channel.send(text);
+        sentCount++;
+        logEvent(gid, 'panic', client.user.id, client.user?.username ?? 'bot', `summon '${text}' en #${channel.name ?? channel.id}`);
+      } catch (e) {
+        console.error(`[panic] guild ${gid}: no pude mandar '${text}':`, e.message);
+      }
+      await new Promise(r => setTimeout(r, PANIC_SUMMON_DELAY_MS));
+    }
+  }
+  await dmOwners(guild, `🆘 **PANIC MODE** en **${guild.name}** (me echaron x${info.streak ?? '?'} en 60s).\nInfinity: ${back ? 'de vuelta en voz ✅' : 'no pudo reentrar ❌'}\nRefuerzos: ${sentCount}/${cfg.summons.length} summons en ${channel ? `#${channel.name}` : 'ningún canal (sin permiso de Enviar mensajes)'}.\nRachas en \`bot> status\`.`);
+  return true;
 }
 // Respaldo por si el evento de salida se pierde: cada 5s comprueba que donde
 // creemos estar en voz el bot siga ahí. Solo actúa con prueba de expulsión
@@ -353,27 +453,34 @@ async function findVoiceKicker(guild, channelId) {
   return null;
 }
 
-// Avisa por DM al dueño del bot (OWNER_ID) y al dueño del servidor cuando
-// echan al bot de voz, indicando quién lo hizo. Registra el evento para bot_logs.
+// Manda DM a los dueños (bot + servidor). Devuelve a quiénes llegó.
+async function dmOwners(guild, msg) {
+  const sent = [];
+  const targets = new Set();
+  const bOwner = botOwnerId();
+  if (bOwner) targets.add(bOwner);
+  else console.warn('[dm] sin OWNER_ID configurado: el aviso solo va al owner del servidor.');
+  if (guild.ownerId) targets.add(guild.ownerId);
+  for (const uid of targets) {
+    try {
+      const u = await client.users.fetch(uid);
+      await u.send(msg);
+      sent.push(uid);
+    } catch (e) {
+      console.warn(`[dm] no pude mandar DM a ${uid}:`, e.message);
+    }
+  }
+  return sent;
+}
+// Avisa por DM a los dueños cuando echan al bot de voz, indicando quién lo
+// hizo. Registra el evento para bot_logs.
 async function notifyBotKicked(guild, { channelName, kicker } = {}) {
   const gid = guild.id;
   const kickerTxt = kicker ? `${kicker.tag ?? kicker.username ?? 'Desconocido'} (${kicker.id})` : 'desconocido (me falta permiso "Ver registro de auditoría" o fue una desconexión)';
   logEvent(gid, 'bot_kicked', kicker?.id ?? '???', kicker?.username ?? kicker?.tag ?? 'Desconocido', `me echó de ${channelName ?? 'voz'} en ${guild.name}`);
   console.warn(`[voz] BOT echado en guild ${gid} (${guild.name}) canal=${channelName ?? '?'} por=${kickerTxt}`);
   const msg = `🚨 Me echaron de voz en **${guild.name}** (canal **${channelName ?? 'desconocido'}**).\nQuién me echó: **${kickerTxt}**\nHora: <t:${Math.floor(Date.now() / 1000)}:F>\nVuelve a meterme con \`join\` cuando quieras.`;
-  const targets = new Set();
-  const botOwner = (process.env.OWNER_ID || '').trim();
-  if (botOwner) targets.add(botOwner);
-  else console.warn('[voz] sin OWNER_ID configurado: el aviso solo va al owner del servidor.');
-  if (guild.ownerId) targets.add(guild.ownerId);
-  for (const uid of targets) {
-    try {
-      const u = await client.users.fetch(uid);
-      await u.send(msg);
-    } catch (e) {
-      console.warn(`[voz] no pude mandar DM de kick a ${uid}:`, e.message);
-    }
-  }
+  await dmOwners(guild, msg);
 }
 
 const BOT_LOG_LABELS = {
@@ -550,6 +657,7 @@ function saveData() {
 loadData();
 loadPrefixes();
 loadAdmins();
+loadPanic();
 setInterval(saveData, 5 * 60 * 1000).unref();
 
 function formatDuration(ms) {
@@ -1184,12 +1292,104 @@ client.on('messageCreate', async message => {
           { name: `📋 \`${prefix}logs\``, value: 'Resumen de los últimos 15 min: entradas/salidas, muteos, transmisiones y sonidos (agregados anti-spam).', inline: false },
           { name: `🤖 \`${prefix}bot_logs\``, value: 'Historial completo en .txt: quién entró/salió, muteos, sonidos y movimientos del bot (incluye quién me echó).', inline: false },
           { name: `🛡️ \`${prefix}admins\``, value: 'Ver admins del bot (por defecto: dueño del servidor y del bot).', inline: false },
+          { name: `🆘 \`${prefix}panic\``, value: 'Ver/configurar el panic mode: summons a otros bots (`!join`, `m!join`…) + rejoin. Cambios solo admins.', inline: false },
           { name: '➕ `/addadmin` · ➖ `/removeadmin`', value: 'Gestionar admins (solo admins). En texto: `addadmin @usuario`.', inline: false },
           { name: '⚙️ `/prefix`', value: 'Ver o cambiar el prefijo (requiere Gestionar servidor).', inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
         .setTimestamp();
       return message.reply({ embeds: [embed] });
+    }
+
+    // Panic mode: ver/configurar summons. Cambios y test solo admins.
+    if (cmd === 'panic' || cmd.startsWith('panic ')) {
+      const gid = message.guild.id;
+      const cfg = getPanic(gid);
+      const after = cmd === 'panic' ? '' : cmd.slice('panic '.length).trim();
+      const afterRaw = /^panic\s/i.test(cmdRaw) ? cmdRaw.replace(/^panic\s+/i, '') : '';
+      const showStatus = () => {
+        const ch = resolvePanicChannel(message.guild);
+        const lines = [
+          `Estado: **${cfg.enabled ? 'ON ✅' : 'OFF ❌'}**`,
+          `Canal: ${cfg.channelId ? `<#${cfg.channelId}>` : `(auto → ${ch ? `#${ch.name}` : 'ninguno con permiso'})`}`,
+          `Summons (${cfg.summons.length}): ${cfg.summons.map((s, i) => `\`${i + 1}.\` \`${s}\``).join(' · ')}`,
+          '',
+          `Se dispara con **${KICK_STREAK_MAX}+ kicks en 60s** (cooldown ${PANIC_COOLDOWN_MS / 60000} min): reentro yo + mando los summons.`,
+          `Cambios (admins): \`${prefix}panic on|off\` · \`${prefix}panic channel #canal|off\` · \`${prefix}panic add <texto>\` · \`${prefix}panic remove <nº|texto>\` · \`${prefix}panic test\``
+        ];
+        return message.reply({ embeds: [embedBase(message).setTitle('🆘 Panic mode').setDescription(lines.join('\n'))] });
+      };
+      if (after === '' || after === 'status' || after === 'list') return showStatus();
+      if (!isBotAdmin(message.guild, message.author.id)) {
+        return message.reply({ embeds: [embedErr(message, 'Solo admins', 'Solo un admin del bot puede configurar el panic mode.')] });
+      }
+      if (after === 'on' || after === 'off') {
+        cfg.enabled = after === 'on';
+        savePanic();
+        return message.reply({ embeds: [embedOk(message, 'Panic mode', `Panic mode **${cfg.enabled ? 'activado ✅' : 'desactivado ❌'}**.`)] });
+      }
+      if (after.startsWith('channel')) {
+        const arg = afterRaw.replace(/^channel\s*/i, '').trim();
+        if (/^(off|auto|none)$/i.test(arg) || !arg) {
+          cfg.channelId = null;
+          savePanic();
+          return message.reply({ embeds: [embedOk(message, 'Panic mode', 'Canal en **auto** (sistema o primer escribible).')] });
+        }
+        const mentioned = message.mentions?.channels?.first?.();
+        const idMatch = arg.match(/(\d{15,25})/);
+        const target = mentioned ?? (idMatch ? message.guild.channels.cache.get(idMatch[1]) : null);
+        if (!target?.isTextBased?.()) {
+          return message.reply({ embeds: [embedErr(message, 'Canal inválido', `Uso: \`${prefix}panic channel #canal\` (mención) o \`${prefix}panic channel off\` para auto.`)] });
+        }
+        cfg.channelId = target.id;
+        savePanic();
+        const warn = botCanSend(target) ? '' : '\n⚠️ Ojo: no tengo permiso de **Enviar mensajes** ahí.';
+        return message.reply({ embeds: [embedOk(message, 'Panic mode', `Summons en <#${target.id}>.${warn}`)] });
+      }
+      if (after.startsWith('add')) {
+        const text = afterRaw.replace(/^add\s*/i, '').trim();
+        if (!text || text.length > 50 || text.includes('\n') || /@(everyone|here)/i.test(text)) {
+          return message.reply({ embeds: [embedErr(message, 'Texto inválido', '1-50 caracteres, una línea, sin `@everyone`/`@here`.')] });
+        }
+        if (cfg.summons.length >= PANIC_MAX_SUMMONS) {
+          return message.reply({ embeds: [embedErr(message, 'Lleno', `Máximo ${PANIC_MAX_SUMMONS} summons. Quita uno con \`${prefix}panic remove <nº>\`.`)] });
+        }
+        if (cfg.summons.some(s => s.toLowerCase() === text.toLowerCase())) {
+          return message.reply({ embeds: [embedInfo(message, 'Ya existe', `\`${text}\` ya está en la lista.`)] });
+        }
+        cfg.summons.push(text);
+        savePanic();
+        return message.reply({ embeds: [embedOk(message, 'Summon añadido', `\`${text}\` (${cfg.summons.length}/${PANIC_MAX_SUMMONS}).`)] });
+      }
+      if (after.startsWith('remove') || after.startsWith('del ')) {
+        const arg = afterRaw.replace(/^(remove|del)\s*/i, '').trim();
+        if (cfg.summons.length <= 1) {
+          return message.reply({ embeds: [embedErr(message, 'No puedo', 'Debe quedar al menos 1 summon.')] });
+        }
+        let idx = -1;
+        if (/^\d+$/.test(arg)) idx = parseInt(arg, 10) - 1;
+        else idx = cfg.summons.findIndex(s => s.toLowerCase() === arg.toLowerCase());
+        if (idx < 0 || idx >= cfg.summons.length) {
+          return message.reply({ embeds: [embedErr(message, 'No lo encuentro', `Uso: \`${prefix}panic remove <nº|texto>\`. Lista con \`${prefix}panic\`.`)] });
+        }
+        const [gone] = cfg.summons.splice(idx, 1);
+        savePanic();
+        return message.reply({ embeds: [embedOk(message, 'Summon quitado', `Fuera: \`${gone}\`.`)] });
+      }
+      if (after === 'test') {
+        const channel = resolvePanicChannel(message.guild);
+        if (!channel) {
+          return message.reply({ embeds: [embedErr(message, 'Sin canal', 'No tengo ningún canal de texto con permiso de Enviar mensajes.')] });
+        }
+        let n = 0;
+        for (const text of cfg.summons) {
+          try { await channel.send(text); n++; } catch (e) { console.error(`[panic] test: no pude mandar '${text}':`, e.message); }
+          await new Promise(r => setTimeout(r, PANIC_SUMMON_DELAY_MS));
+        }
+        logEvent(gid, 'panic', message.author.id, message.author.username, `test manual: ${n}/${cfg.summons.length} summons en #${channel.name ?? channel.id}`);
+        return message.reply({ embeds: [embedOk(message, 'Test panic', `Mandados **${n}/${cfg.summons.length}** summons en <#${channel.id}>. Mira si entraron los bots.`)] });
+      }
+      return showStatus();
     }
 
     if (cmd === 'prefix') {
@@ -1569,7 +1769,7 @@ async function getRemoteSha() {
 }
 
 // Archivos/carpetas que NUNCA se pisan en el hosting
-const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'sounds', 'logs', 'timeData.json', 'prefixes.json', 'admins.json', '.version']);
+const UPDATE_EXCLUDE = new Set(['node_modules', '.env', '.git', 'clips', 'sounds', 'logs', 'timeData.json', 'prefixes.json', 'admins.json', 'panic.json', '.version']);
 
 async function copyFreshUpdate(srcDir) {
   const entries = await fsp.readdir(srcDir, { withFileTypes: true });
@@ -1795,7 +1995,8 @@ async function runDiagnostics({ fix = false } = {}) {
   for (const [label, file, loader] of [
     ['tiempos', DATA_FILE, loadData],
     ['prefijos', PREFIX_FILE, loadPrefixes],
-    ['admins', ADMIN_FILE, loadAdmins]
+    ['admins', ADMIN_FILE, loadAdmins],
+    ['panic', PANIC_FILE, loadPanic]
   ]) {
     try {
       if (fs.existsSync(file)) JSON.parse(fs.readFileSync(file, 'utf8'));
