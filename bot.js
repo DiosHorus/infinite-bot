@@ -142,6 +142,122 @@ function markExpectedLeave(guildId) {
 // movimientos repetidos para no entrar en entra/sale infinito.
 const botReengageAt = new Map();
 
+// --- Detección rápida de expulsión del bot ---
+// Vía 1 (instantánea): voiceStateUpdate del propio bot (~1s).
+// Vía 2 (respaldo): vigilancia cada 5s por si el evento se pierde/retrasa.
+// Todo lo no-previsto pasa por onBotRemoved(): PUNTO DE ENGANCHE para las
+// futuras medidas (ahora mismo solo avisa por DM).
+const BOT_WATCH_INTERVAL_MS = 5000;
+const BOT_JOIN_GRACE_MS = 10000; // tras un join, el watchdog no sospecha
+const BOT_EXIT_DEDUP_MS = 30000; // misma salida no se procesa 2 veces
+const botJoinedAt = new Map(); // guildId -> timestamp del último join
+const handledBotExit = new Map(); // guildId -> timestamp de salida ya tratada
+const botExitWatch = new Map(); // guildId -> última salida { at, channelId, channelName, expected, source, kickerId, kickerTag }
+function recordBotExit(guildId, info) {
+  botExitWatch.set(guildId, { at: Date.now(), ...info });
+  if (botExitWatch.size > 100) botExitWatch.delete(botExitWatch.keys().next().value);
+}
+function getLastBotExit(guildId) {
+  return botExitWatch.get(guildId) ?? null;
+}
+function wasBotExitHandled(guildId) {
+  const last = handledBotExit.get(guildId) ?? 0;
+  return Date.now() - last < BOT_EXIT_DEDUP_MS;
+}
+function markBotExitHandled(guildId) {
+  handledBotExit.set(guildId, Date.now());
+}
+// Ruta única para salidas NO previstas del bot: congela tiempos, limpia,
+// registra y dispara el enganche de medidas. `kicker` puede venir ya
+// resuelto (watchdog) o null (se atribuye por auditoría en 2º plano).
+function handleUnexpectedBotExit(guild, { channelId = null, channelName = null, source = 'event', kicker = undefined } = {}) {
+  const gid = guild.id;
+  if (wasBotExitHandled(gid)) return false; // duplicada (evento + watchdog)
+  markBotExitHandled(gid);
+  console.warn(`[voz] BOT fuera de voz en guild ${gid} (${guild.name}) canal=${channelName ?? channelId ?? '?'} fuente=${source}. Congelo tiempos y limpio.`);
+  finalizeGuildTimes(gid);
+  try { getVoiceConnection(gid)?.destroy(); } catch { /* noop */ }
+  callConnections.delete(gid);
+  isRecording.set(gid, false);
+  botJoinedAt.delete(gid);
+  saveData();
+  recordBotExit(gid, { channelId, channelName, expected: false, source, kickerId: kicker?.id ?? null, kickerTag: kicker?.tag ?? null });
+  onBotRemoved(guild, { channelId, channelName, source, kicker }).catch(e => {
+    console.error(`[voz] fallo en medidas anti-kick guild ${gid}:`, e.message);
+  });
+  return true;
+}
+// PUNTO DE ENGANCHE — futuras medidas anti-kick van aquí.
+// Hoy: atribuye al responsable (si no viene dado) y avisa por DM.
+async function onBotRemoved(guild, { channelId = null, channelName = null, source = 'event', kicker = undefined } = {}) {
+  const gid = guild.id;
+  try {
+    let who = kicker;
+    if (who === undefined) {
+      who = await findVoiceKicker(guild, channelId);
+      const rec = botExitWatch.get(gid);
+      if (rec) {
+        rec.kickerId = who?.id ?? null;
+        rec.kickerTag = who?.tag ?? null;
+      }
+    }
+    await notifyBotKicked(guild, { channelName, kicker: who ?? null });
+  } catch (e) {
+    console.error(`[voz] fallo avisando kick en guild ${gid}:`, e.message);
+  }
+}
+// Respaldo por si el evento de salida se pierde: cada 5s comprueba que donde
+// creemos estar en voz el bot siga ahí. Solo actúa con prueba de expulsión
+// (auditoría reciente) o conexión muerta; ante la duda NO toca nada.
+async function botWatchdogTick() {
+  for (const [gid, conn] of [...callConnections]) {
+    try {
+      const guild = client.guilds.cache.get(gid);
+      if (!guild) continue;
+      const live = getVoiceConnection(gid);
+      if (!live || conn?.state?.status === VoiceConnectionStatus.Destroyed) continue; // lo gestiona getLiveConnection
+      const meChannelId = guild.members.me?.voice?.channelId ?? conn?.joinConfig?.channelId ?? null;
+      if (meChannelId) continue; // sigue en voz, todo bien
+      if (Date.now() - (botJoinedAt.get(gid) ?? 0) < BOT_JOIN_GRACE_MS) continue; // join reciente, dando tiempo a Discord
+      // Fuera de voz según caché y sin evento: ¿kick confirmado en auditoría?
+      const kicker = await findVoiceKickerFast(guild, conn?.joinConfig?.channelId ?? null);
+      if (!kicker) continue; // sin prueba: no toco nada (evita falsos positivos)
+      const channelId = conn?.joinConfig?.channelId ?? null;
+      let channelName = null;
+      try { channelName = guild.channels.cache.get(channelId)?.name ?? null; } catch { /* noop */ }
+      handleUnexpectedBotExit(guild, { channelId, channelName, source: 'watchdog', kicker });
+    } catch (e) {
+      console.error(`[voz] watchdog guild ${gid}:`, e.message);
+    }
+  }
+}
+// Variante sin espera para el watchdog (el evento ya se perdió: no hay prisa
+// pero tampoco espera extra; la ventana de auditoría cubre el hueco).
+async function findVoiceKickerFast(guild, channelId) {
+  try {
+    const me = client.user?.id;
+    if (!me || !guild?.fetchAuditLogs) return null;
+    const logs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberDisconnect, limit: 5 });
+    const now = Date.now();
+    for (const entry of logs.entries.values()) {
+      if (entry.target?.id !== me) continue;
+      if (now - entry.createdTimestamp > 15000) continue;
+      const entryChannelId = entry.extra?.channel?.id ?? entry.extra?.channelId ?? null;
+      if (channelId && entryChannelId && entryChannelId !== channelId) continue;
+      if (entry.executor && entry.executor.id !== me) return entry.executor;
+    }
+  } catch (e) {
+    console.warn(`[voz] watchdog sin auditoría en guild ${guild?.id}:`, e.message);
+  }
+  return null;
+}
+function setupBotWatchdog() {
+  setInterval(() => {
+    botWatchdogTick().catch(e => console.error('[voz] watchdog:', e.message));
+  }, BOT_WATCH_INTERVAL_MS).unref();
+  console.log(`Vigilancia anti-kick activada: chequeo cada ${BOT_WATCH_INTERVAL_MS / 1000}s.`);
+}
+
 // Busca en la auditoría quién desconectó al bot de voz (requiere permiso
 // "Ver registro de auditoría"). Devuelve el executor o null si no hay rastro.
 async function findVoiceKicker(guild, channelId) {
@@ -387,6 +503,7 @@ function getLiveConnection(guildId) {
       try { stored.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
       isRecording.set(guildId, false);
+      botJoinedAt.delete(guildId);
       saveData();
     }
     return null;
@@ -400,6 +517,7 @@ function getLiveConnection(guildId) {
     try { stored.destroy(); } catch { /* noop */ }
     callConnections.delete(guildId);
     isRecording.set(guildId, false);
+    botJoinedAt.delete(guildId);
     saveData();
     return null;
   }
@@ -432,6 +550,7 @@ function attachConnectionHandlers(connection, guildId) {
           try { connection.destroy(); } catch { /* noop */ }
           callConnections.delete(guildId);
           isRecording.set(guildId, false);
+          botJoinedAt.delete(guildId);
           saveData();
         } else {
           console.log(`[voz] guild ${guildId}: reconexión OK (status=${st})`);
@@ -627,6 +746,7 @@ client.on('messageCreate', async message => {
         callConnections.set(guildId, connection);
         setupAudioReceiver(connection, guildId);
         attachConnectionHandlers(connection, guildId);
+        botJoinedAt.set(guildId, Date.now());
         isRecording.set(guildId, false);
         audioBuffers.delete(guildId); // sesión nueva: sin restos de audio anterior
         console.log(`[cmd] join guild=${guildId} canal=${voiceChannel.id} por=${message.author.tag}`);
@@ -669,6 +789,7 @@ client.on('messageCreate', async message => {
       try { conn.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
       isRecording.set(guildId, false);
+      botJoinedAt.delete(guildId);
       saveData();
       logEvent(guildId, 'bot_leave', client.user.id, client.user?.username ?? 'bot', `salida con leave por ${message.author.tag}`);
       return message.reply({ embeds: [embedOk(message, 'Me fui', `Tiempos guardados. Usa \`${prefix}join\` cuando quieras que vuelva.`)] });
@@ -867,6 +988,7 @@ client.on('messageCreate', async message => {
           callConnections.set(message.guild.id, connection);
           setupAudioReceiver(connection, message.guild.id);
           attachConnectionHandlers(connection, message.guild.id);
+          botJoinedAt.set(message.guild.id, Date.now());
           logEvent(message.guild.id, 'bot_join', client.user.id, client.user?.username ?? 'bot', `auto-join a ${message.member.voice.channel.name} por sonido de ${message.author.tag}`);
         } catch (e) {
           console.error('Error al unirse para sonido:', e.message);
@@ -1157,25 +1279,19 @@ client.on('voiceStateUpdate', (oldState, newState) => {
       if (wasExpected) expectedBotLeave.delete(gid);
       const channelName = oldState.channel?.name ?? null;
       const oldChannelId = oldState.channelId ?? null;
-      console.warn(`[voz] BOT salió/desconectado en guild ${gid} (estaba en ${oldChannelId ?? '???'}). Congelo tiempos y limpio.`);
-      finalizeGuildTimes(gid);
-      try { getVoiceConnection(gid)?.destroy(); } catch { /* noop */ }
-      callConnections.delete(gid);
-      isRecording.set(gid, false);
-      saveData();
       if (wasExpected) {
+        console.warn(`[voz] BOT salió (previsto) en guild ${gid} (estaba en ${oldChannelId ?? '???'}). Congelo tiempos y limpio.`);
+        finalizeGuildTimes(gid);
+        try { getVoiceConnection(gid)?.destroy(); } catch { /* noop */ }
+        callConnections.delete(gid);
+        isRecording.set(gid, false);
+        botJoinedAt.delete(gid);
+        saveData();
+        recordBotExit(gid, { channelId: oldChannelId, channelName, expected: true, source: 'event', kickerId: null, kickerTag: null });
         logEvent(gid, 'bot_leave', client.user.id, client.user?.username ?? 'bot', `salida prevista de ${channelName ?? 'voz'}`);
       } else {
-        // Posible kick/expulsión: se busca al responsable en auditoría y se
-        // avisa por DM al dueño del bot y al del servidor (no bloquea el evento).
-        (async () => {
-          try {
-            const kicker = await findVoiceKicker(guild, oldChannelId);
-            await notifyBotKicked(guild, { channelName, kicker });
-          } catch (e) {
-            console.error(`[voz] fallo avisando kick en guild ${gid}:`, e.message);
-          }
-        })();
+        // Posible kick/expulsión: detección inmediata + medidas (DM) vía hook.
+        handleUnexpectedBotExit(guild, { channelId: oldChannelId, channelName, source: 'event' });
       }
     // Solo es "movido" si estaba EN un canal y aparece EN otro distinto.
     // El null -> canal es el join inicial (la conexión ya existe, no hay nada
@@ -1205,6 +1321,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         callConnections.set(gid, conn);
         setupAudioReceiver(conn, gid);
         attachConnectionHandlers(conn, gid);
+        botJoinedAt.set(gid, Date.now());
       } catch (e) {
         console.error(`[voz] BOT no pudo re-enganchar al canal nuevo en guild ${gid}:`, e.message);
       }
@@ -1662,6 +1779,7 @@ async function runDiagnostics({ fix = false } = {}) {
           try { conn?.destroy(); } catch { /* noop */ }
           callConnections.delete(gid);
           isRecording.set(gid, false);
+          botJoinedAt.delete(gid);
         }
       }
     } catch { zombies++; }
@@ -1710,6 +1828,13 @@ function setupConsole() {
         console.log(`versión: ${v} · uptime: ${Math.floor(process.uptime())}s`);
         console.log(`repo: ${REPO_DIR} (.git: ${fs.existsSync(path.join(REPO_DIR, '.git')) ? 'sí' : 'NO'})`);
         console.log(`guilds: ${client.guilds.cache.size} · voz: ${callConnections.size}`);
+        if (botExitWatch.size > 0) {
+          for (const [gid, ex] of botExitWatch) {
+            console.log(`salida ${gid}: ${ex.expected ? 'prevista' : 'NO prevista'} · ${ex.channelName ?? ex.channelId ?? '?'} · ${new Date(ex.at).toLocaleString()} · por=${ex.kickerTag ?? ex.kickerId ?? '?'} · vía=${ex.source}`);
+          }
+        } else {
+          console.log('salidas del bot: ninguna registrada');
+        }
         console.log(`último check update: ${lastUpdateCheck ? lastUpdateCheck.toLocaleString() : '—'} (${lastUpdateResult})`);
         break;
       }
@@ -1762,5 +1887,6 @@ client.login(process.env.DISCORD_TOKEN).then(async () => {
   setupConsole();
   setupAutoUpdate();
   setupAutoDebug();
+  setupBotWatchdog();
   await runDiagnostics({ fix: true }).catch(e => console.error('[debug]', e.message));
 });
