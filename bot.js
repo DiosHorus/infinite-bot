@@ -232,17 +232,17 @@ async function rejoinAfterKick(guild, { channelId, channelName = null } = {}) {
   }
   return doRejoin(guild, channelId, `${st.count} en 60s`);
 }
-// Núcleo del rejoin (lo usan el anti-kick y el panic mode): espera 500ms,
-// entra al canal, reconecta audio y retoma tiempos. Un solo intento.
+// Núcleo del rejoin (lo usan el anti-kick y el panic mode): entra AL TOQUE
+// (intento inmediato) con un reintento a los 500ms si el primero falla,
+// reconecta audio y retoma tiempos.
 async function doRejoin(guild, channelId, note = '') {
   const gid = guild.id;
-  await new Promise(r => setTimeout(r, 500));
-  try {
-    const channel = guild.channels.cache.get(channelId) ?? await guild.channels.fetch(channelId).catch(() => null);
-    if (!channel?.isVoiceBased?.()) {
-      console.warn(`[voz] guild ${gid}: no reentro, el canal ${channelId} ya no existe.`);
-      return false;
-    }
+  const channel = guild.channels.cache.get(channelId) ?? await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isVoiceBased?.()) {
+    console.warn(`[voz] guild ${gid}: no reentro, el canal ${channelId} ya no existe.`);
+    return false;
+  }
+  const attempt = () => {
     const connection = joinVoiceChannel({
       channelId,
       guildId: gid,
@@ -253,6 +253,22 @@ async function doRejoin(guild, channelId, note = '') {
     callConnections.set(gid, connection);
     setupAudioReceiver(connection, gid);
     attachConnectionHandlers(connection, gid);
+    return connection;
+  };
+  let connection = null;
+  try {
+    connection = attempt();
+  } catch (e1) {
+    console.warn(`[voz] guild ${gid}: rejoin inmediato falló (${e1.message?.split('\n')[0]}), reintento en 500ms...`);
+    await new Promise(r => setTimeout(r, 500));
+    try {
+      connection = attempt();
+    } catch (e2) {
+      console.error(`[voz] guild ${gid}: no pude reentrar a ${channelId}:`, e2.message);
+      return false;
+    }
+  }
+  try {
     botJoinedAt.set(gid, Date.now());
     handledBotExit.delete(gid); // el próximo kick real debe procesarse
     isRecording.set(gid, false);
@@ -272,23 +288,22 @@ async function doRejoin(guild, channelId, note = '') {
     const rec = botExitWatch.get(gid);
     if (rec) rec.rejoined = true;
     console.log(`[voz] guild ${gid}: reentré a ${channel.name ?? channelId}${note ? ` (${note})` : ''}.`);
-    // Alarma en voz (opcional): si existe sounds/panic.mp3, suena al reentrar
-    // tras un kick para que los humanos del canal se enteren.
-    try {
-      const alarmPath = path.join(soundsDir, 'panic.mp3');
-      if (fs.existsSync(alarmPath)) {
-        const { player } = getGuildPlayer(gid, connection);
-        player.play(createAudioResource(alarmPath, { inputType: StreamType.Arbitrary }));
-        console.log(`[panic] guild ${gid}: alarma sonando.`);
-      }
-    } catch (e) {
-      console.warn(`[panic] guild ${gid}: no pude sonar la alarma:`, e.message);
-    }
-    return true;
   } catch (e) {
-    console.error(`[voz] guild ${gid}: no pude reentrar a ${channelId}:`, e.message);
-    return false;
+    console.error(`[voz] guild ${gid}: entré pero falló el post-join:`, e.message);
   }
+  // Alarma en voz (opcional): si existe sounds/panic.mp3, suena al reentrar
+  // tras un kick para que los humanos del canal se enteren.
+  try {
+    const alarmPath = path.join(soundsDir, 'panic.mp3');
+    if (fs.existsSync(alarmPath)) {
+      const { player } = getGuildPlayer(gid, connection);
+      player.play(createAudioResource(alarmPath, { inputType: StreamType.Arbitrary }));
+      console.log(`[panic] guild ${gid}: alarma sonando.`);
+    }
+  } catch (e) {
+    console.warn(`[panic] guild ${gid}: no pude sonar la alarma:`, e.message);
+  }
+  return true;
 }
 // --- Panic mode: si nos echan en bucle, se traen refuerzos ---
 // Manda en un canal de texto los comandos de join de otros bots
@@ -423,6 +438,55 @@ async function enterPanicMode(guild, info = {}) {
   await dmOwners(guild, `🆘 **PANIC MODE** en **${guild.name}** (me echaron x${info.streak ?? '?'} en 60s).\nInfinity: ${back ? 'de vuelta en voz ✅' : 'no pudo reentrar ❌'}\nRefuerzos: ${sentCount}/${cfg.summons.length} summons en ${channel ? `#${channel.name}` : 'ningún canal (sin permiso de Enviar mensajes)'} (vía ${via}).\nSi los bots no entraron (ignoran mensajes no-humanos), pega esto en ${channel ? `#${channel.name}` : 'el chat'}:\n\`\`\`\n${pasteBlock}\n\`\`\`\nRachas en \`bot> status\`.`);
   return true;
 }
+// --- Subida de la alarma del panic mode (sounds/panic.mp3) ---
+// Descarga el adjunto, valida que sea audio y lo normaliza a MP3.
+// Devuelve { ok, detail } para responder al admin.
+const PANIC_SOUND_MAX_BYTES = 8 * 1024 * 1024;
+const PANIC_SOUND_EXTS = ['mp3', 'wav', 'ogg', 'm4a'];
+async function savePanicSoundFromUrl(url, { filename = '', contentType = '', size = 0 } = {}) {
+  const ext = (filename.split('.').pop() || '').toLowerCase().split(/[^a-z0-9]/)[0];
+  if (size && size > PANIC_SOUND_MAX_BYTES) {
+    return { ok: false, detail: `Pesa ${(size / 1048576).toFixed(1)}MB: máximo 8MB (ideal <1MB para una alarma).` };
+  }
+  if (!PANIC_SOUND_EXTS.includes(ext) && !(contentType || '').startsWith('audio/')) {
+    return { ok: false, detail: 'Tiene que ser audio: MP3/WAV/OGG/M4A.' };
+  }
+  const tmpIn = path.join(require('os').tmpdir(), `panicup-${Date.now()}.${ext || 'bin'}`);
+  const tmpOut = path.join(soundsDir, 'panic.tmp.mp3');
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 30000);
+    let buf;
+    try {
+      const res = await fetch(url, { signal: ctrl.signal });
+      if (!res.ok) return { ok: false, detail: `No pude descargarlo (HTTP ${res.status}).` };
+      buf = Buffer.from(await res.arrayBuffer());
+    } catch (e) {
+      return { ok: false, detail: e.name === 'AbortError' ? 'Tardó demasiado en descargar (timeout 30s).' : `Fallo de descarga: ${e.message}` };
+    } finally {
+      clearTimeout(t);
+    }
+    if (buf.length === 0) return { ok: false, detail: 'Archivo vacío.' };
+    if (buf.length > PANIC_SOUND_MAX_BYTES) return { ok: false, detail: `Pesa ${(buf.length / 1048576).toFixed(1)}MB: máximo 8MB.` };
+    await fsp.writeFile(tmpIn, buf);
+    // Normalizo a MP3: si no es audio real, ffmpeg falla aquí y no se pisa nada
+    let duration = '?';
+    try {
+      const { stderr } = await execFileAsync('ffmpeg', ['-y', '-i', tmpIn, '-c:a', 'libmp3lame', '-q:a', '4', '-ar', '48000', '-ac', '2', tmpOut], { timeout: 60000 });
+      const dm = String(stderr || '').match(/Duration:\s*(\d+:\d+[\d:.]*)/);
+      if (dm) duration = dm[1].split('.')[0];
+    } catch (e) {
+      await fsp.unlink(tmpOut).catch(() => {});
+      const cause = String(e.message || '').split('\n').map(l => l.trim()).filter(Boolean).slice(-1)[0]?.slice(0, 150) || 'formato no soportado';
+      return { ok: false, detail: `No es audio válido (${cause}).` };
+    }
+    await fsp.rename(tmpOut, path.join(soundsDir, 'panic.mp3'));
+    const st = await fsp.stat(path.join(soundsDir, 'panic.mp3'));
+    return { ok: true, detail: `${(st.size / 1024).toFixed(0)}KB · ${duration}` };
+  } finally {
+    await fsp.unlink(tmpIn).catch(() => {});
+  }
+}
 // Respaldo por si el evento de salida se pierde: cada 5s comprueba que donde
 // creemos estar en voz el bot siga ahí. Solo actúa con prueba de expulsión
 // (auditoría reciente) o conexión muerta; ante la duda NO toca nada.
@@ -476,13 +540,12 @@ function setupBotWatchdog() {
 }
 
 // Busca en la auditoría quién desconectó al bot de voz (requiere permiso
-// "Ver registro de auditoría"). Devuelve el executor o null si no hay rastro.
+// "Ver registro de auditoría"). Intento inmediato + un reintento a los 1.5s
+// (la entrada a veces llega tarde). Devuelve el executor o null.
 async function findVoiceKicker(guild, channelId) {
-  try {
+  const scan = async () => {
     const me = client.user?.id;
     if (!me || !guild?.fetchAuditLogs) return null;
-    // Pequeña espera: la entrada de auditoría a veces llega ~1-2s después del evento
-    await new Promise(r => setTimeout(r, 2000));
     const logs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberDisconnect, limit: 5 });
     const now = Date.now();
     for (const entry of logs.entries.values()) {
@@ -492,10 +555,17 @@ async function findVoiceKicker(guild, channelId) {
       if (channelId && entryChannelId && entryChannelId !== channelId) continue;
       if (entry.executor && entry.executor.id !== me) return entry.executor;
     }
+    return null;
+  };
+  try {
+    const first = await scan();
+    if (first) return first;
+    await new Promise(r => setTimeout(r, 1500));
+    return await scan();
   } catch (e) {
     console.warn(`[voz] no pude leer audit logs en guild ${guild?.id}:`, e.message);
+    return null;
   }
-  return null;
 }
 
 // Manda DM a los dueños (bot + servidor). Devuelve a quiénes llegó.
@@ -832,9 +902,13 @@ client.once('ready', async () => {
       .setName('removeadmin')
       .setDescription('Quitar admin del bot a un usuario (solo admins)')
       .addUserOption(o => o.setName('usuario').setDescription('Usuario a quitar admin').setRequired(true));
+    const cmdAddPanicSound = new SlashCommandBuilder()
+      .setName('addpanicsound')
+      .setDescription('Sube la alarma del panic mode (solo admins)')
+      .addAttachmentOption(o => o.setName('sonido').setDescription('MP3/WAV/OGG/M4A, máx 8MB').setRequired(true));
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    await rest.put(Routes.applicationCommands(client.user.id), { body: [cmdPrefix.toJSON(), cmdAddAdmin.toJSON(), cmdRemoveAdmin.toJSON()] });
-    console.log('Slash /prefix, /addadmin, /removeadmin registrados.');
+    await rest.put(Routes.applicationCommands(client.user.id), { body: [cmdPrefix.toJSON(), cmdAddAdmin.toJSON(), cmdRemoveAdmin.toJSON(), cmdAddPanicSound.toJSON()] });
+    console.log('Slash /prefix, /addadmin, /removeadmin, /addpanicsound registrados.');
   } catch (e) {
     console.error('No se pudo registrar slash:', e.message);
   }
@@ -876,6 +950,26 @@ client.on('interactionCreate', async interaction => {
     } catch (e) {
       console.error(`Error en /${interaction.commandName}:`, e.message);
       if (!interaction.replied) await interaction.reply({ content: 'Falló el comando.', ephemeral: true }).catch(() => {});
+    }
+    return;
+  }
+  if (interaction.commandName === 'addpanicsound') {
+    try {
+      const guild = interaction.guild;
+      if (!guild) return interaction.reply({ content: 'Solo funciona en servidores.', ephemeral: true });
+      if (!isBotAdmin(guild, interaction.user.id)) {
+        return interaction.reply({ content: '⛔ Solo un admin del bot puede cambiar la alarma.', ephemeral: true });
+      }
+      const att = interaction.options.getAttachment('sonido', true);
+      await interaction.deferReply({ ephemeral: true });
+      const res = await savePanicSoundFromUrl(att.url, { filename: att.name ?? '', contentType: att.contentType ?? '', size: att.size ?? 0 });
+      console.log(`[panic] ${interaction.user.tag} subió alarma en guild ${interaction.guildId}: ${res.ok ? 'OK' : 'fallo'} (${res.detail})`);
+      if (res.ok) return interaction.editReply({ content: `✅ Alarma lista: ${res.detail}. Sonará al reentrar tras un kick.` });
+      return interaction.editReply({ content: `❌ No vale: ${res.detail}` });
+    } catch (e) {
+      console.error('Error en /addpanicsound:', e.message);
+      if (!interaction.replied) await interaction.reply({ content: 'Falló la subida.', ephemeral: true }).catch(() => {});
+      else await interaction.editReply({ content: 'Falló la subida.' }).catch(() => {});
     }
     return;
   }
@@ -1332,7 +1426,7 @@ client.on('messageCreate', async message => {
           { name: '🔊 Sonidos', value: `\`${prefix}sounds\` lista · \`${prefix}s <nombre>\` reproduce.`, inline: false },
           { name: '📋 Logs', value: `\`${prefix}logs\` resumen 15 min · \`${prefix}bot_logs\` historial completo en .txt (incluye quién me echó).`, inline: false },
           { name: '🛡️ Admins (por defecto: dueño del server + dueño del bot)', value: `\`${prefix}admins\` ver · \`/addadmin @usuario\` · \`/removeadmin @usuario\` (en texto: \`${prefix}addadmin @usuario\`). Solo admins pueden sacarme (\`${prefix}leave\`) y gestionar admins.`, inline: false },
-          { name: '🆘 Panic mode (anti-kick: reentro a los 500ms, con racha llamo refuerzos)', value: `\`${prefix}panic\` ver · \`${prefix}panic on|off\` · \`${prefix}panic kicks <1-5>\` · \`${prefix}panic channel #canal|off\` · \`${prefix}panic add|remove <texto>\` · \`${prefix}panic test\`. Cambios solo admins.`, inline: false },
+          { name: '🆘 Panic mode (anti-kick: reentro al instante, con racha llamo refuerzos)', value: `\`${prefix}panic\` ver/configurar · \`/addpanicsound\` sube la alarma en voz (solo admins).`, inline: false },
           { name: '⚙️ Prefijo', value: `\`/prefix nuevo:!\` (requiere Gestionar servidor) · ver con \`${prefix}prefix\`.`, inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
@@ -1445,6 +1539,28 @@ client.on('messageCreate', async message => {
         return message.reply({ embeds: [embedOk(message, 'Test panic', `Mandados **${n}/${cfg.summons.length}** summons en <#${channel.id}> (vía ${via}). Mira si entraron los bots.`)] });
       }
       return showStatus();
+    }
+
+    // Fallback en texto de /addpanicsound: el audio va adjunto al MISMO mensaje.
+    if (cmd === 'addpanicsound') {
+      if (!isBotAdmin(message.guild, message.author.id)) {
+        return message.reply({ embeds: [embedErr(message, 'Solo admins', 'Solo un admin del bot puede cambiar la alarma.')] });
+      }
+      const alarmNow = fs.existsSync(path.join(soundsDir, 'panic.mp3'));
+      const att = message.attachments?.first?.();
+      if (!att) {
+        return message.reply({ embeds: [embedInfo(message, '🔊 Alarma panic', `Adjunta el audio en el MISMO mensaje: \`${prefix}addpanicsound\` + archivo (MP3/WAV/OGG/M4A, máx 8MB).\nO usa \`/addpanicsound\`. Actual: ${alarmNow ? 'puesta ✅' : 'sin poner ❌'}`)] });
+      }
+      const wait = await message.reply({ embeds: [embedInfo(message, '⏳ Procesando', 'Descargando y normalizando a MP3...')] });
+      try {
+        const res = await savePanicSoundFromUrl(att.url, { filename: att.name ?? '', contentType: att.contentType ?? '', size: att.size ?? 0 });
+        console.log(`[panic] ${message.author.tag} subió alarma en guild ${message.guild.id} (texto): ${res.ok ? 'OK' : 'fallo'} (${res.detail})`);
+        if (res.ok) return wait.edit({ embeds: [embedOk(message, 'Alarma lista', `${res.detail}. Sonará al reentrar tras un kick.`)] });
+        return wait.edit({ embeds: [embedErr(message, 'No vale', res.detail)] });
+      } catch (e) {
+        console.error('Error en addpanicsound texto:', e.message);
+        return wait.edit({ embeds: [embedErr(message, 'Falló la subida', 'Inténtalo de nuevo.')] }).catch(() => {});
+      }
     }
 
     if (cmd === 'prefix') {
