@@ -1282,21 +1282,15 @@ client.on('messageCreate', async message => {
       const embed = new EmbedBuilder()
         .setColor(0x5865F2)
         .setTitle('📖 Comandos de Infinite Bot')
-        .setDescription(`Mido tiempo en llamada y genero clips del audio.\nPrefijo actual: \`${prefix}\` (cámbialo con \`/prefix\`).`)
+        .setDescription(`Mido tiempo en llamada y genero clips del audio.\nPrefijo actual: \`${prefix}\` (cámbialo con \`/prefix\` o \`${prefix}prefix\`).`)
         .addFields(
-          { name: `🔊 \`${prefix}join\``, value: 'Me uno a tu canal de voz.', inline: false },
-          { name: `🔴 \`${prefix}start\``, value: 'Activa la grabación.', inline: false },
-          { name: `⏸️ \`${prefix}stop\``, value: 'Pausa la grabación (el audio guardado sigue para clips).', inline: false },
-          { name: `👋 \`${prefix}leave\``, value: 'Guardo tiempos y salgo del canal (solo admins).', inline: false },
-          { name: `🏆 \`${prefix}lb\``, value: 'Top 10 de tiempo en llamada de este servidor.', inline: false },
-          { name: `✂️ \`${prefix}clip\``, value: `Genera un MP3 con los últimos ${CLIP_SECONDS / 60} min (cooldown 30s).`, inline: false },
-          { name: `🔊 \`${prefix}s <nombre>\``, value: `Reproduce un sonido de \`sounds/\`. Lista con \`${prefix}sounds\`.`, inline: false },
-          { name: `📋 \`${prefix}logs\``, value: 'Resumen de los últimos 15 min: entradas/salidas, muteos, transmisiones y sonidos (agregados anti-spam).', inline: false },
-          { name: `🤖 \`${prefix}bot_logs\``, value: 'Historial completo en .txt: quién entró/salió, muteos, sonidos y movimientos del bot (incluye quién me echó).', inline: false },
-          { name: `🛡️ \`${prefix}admins\``, value: 'Ver admins del bot (por defecto: dueño del servidor y del bot).', inline: false },
-          { name: `🆘 \`${prefix}panic\``, value: 'Ver/configurar el panic mode: summons a otros bots (`!join`, `m!join`…) + rejoin. Cambios solo admins.', inline: false },
-          { name: '➕ `/addadmin` · ➖ `/removeadmin`', value: 'Gestionar admins (solo admins). En texto: `addadmin @usuario`.', inline: false },
-          { name: '⚙️ `/prefix`', value: 'Ver o cambiar el prefijo (requiere Gestionar servidor).', inline: false }
+          { name: '🔊 Voz y grabación', value: `\`${prefix}join\` entro a tu canal · \`${prefix}start\` grabo · \`${prefix}stop\` pauso · \`${prefix}clip\` MP3 últimos ${CLIP_SECONDS / 60} min (cooldown 30s) · \`${prefix}leave\` salgo (🛡️ admins)`, inline: false },
+          { name: '🏆 Tiempo', value: `\`${prefix}lb\` top 10 del servidor.`, inline: false },
+          { name: '🔊 Sonidos', value: `\`${prefix}sounds\` lista · \`${prefix}s <nombre>\` reproduce.`, inline: false },
+          { name: '📋 Logs', value: `\`${prefix}logs\` resumen 15 min · \`${prefix}bot_logs\` historial completo en .txt (incluye quién me echó).`, inline: false },
+          { name: '🛡️ Admins (por defecto: dueño del server + dueño del bot)', value: `\`${prefix}admins\` ver · \`/addadmin @usuario\` · \`/removeadmin @usuario\` (en texto: \`${prefix}addadmin @usuario\`). Solo admins pueden sacarme (\`${prefix}leave\`) y gestionar admins.`, inline: false },
+          { name: '🆘 Panic mode (anti-kick: reentro a los 500ms, con racha llamo refuerzos)', value: `\`${prefix}panic\` ver · \`${prefix}panic on|off\` · \`${prefix}panic kicks <1-5>\` · \`${prefix}panic channel #canal|off\` · \`${prefix}panic add|remove <texto>\` · \`${prefix}panic test\`. Cambios solo admins.`, inline: false },
+          { name: '⚙️ Prefijo', value: `\`/prefix nuevo:!\` (requiere Gestionar servidor) · ver con \`${prefix}prefix\`.`, inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
         .setTimestamp();
