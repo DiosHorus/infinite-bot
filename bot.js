@@ -224,8 +224,9 @@ async function rejoinAfterKick(guild, { channelId, channelName = null } = {}) {
   if (!st || now - st.firstAt > KICK_STREAK_WINDOW_MS) st = { count: 1, firstAt: now };
   else st.count++;
   kickStreak.set(gid, st);
-  if (st.count > KICK_STREAK_MAX) {
-    console.warn(`[voz] guild ${gid}: ${st.count} kicks en 60s, NO reentro. Paso a panic mode.`);
+  const maxKicks = getPanic(gid).kicks ?? KICK_STREAK_MAX;
+  if (st.count >= maxKicks) {
+    console.warn(`[voz] guild ${gid}: ${st.count} kicks en 60s (límite ${maxKicks}), NO reentro. Paso a panic mode.`);
     await enterPanicMode(guild, { reason: 'kick-loop', streak: st.count, channelId, channelName });
     return false;
   }
@@ -289,7 +290,7 @@ const DEFAULT_SUMMONS = ['!join', 'm!join', '-join'];
 const panicCfg = new Map(); // guildId -> { enabled, channelId|null, summons[] }
 const panicAt = new Map(); // guildId -> último disparo
 function getPanic(guildId) {
-  if (!panicCfg.has(guildId)) panicCfg.set(guildId, { enabled: true, channelId: null, summons: [...DEFAULT_SUMMONS] });
+  if (!panicCfg.has(guildId)) panicCfg.set(guildId, { enabled: true, channelId: null, summons: [...DEFAULT_SUMMONS], kicks: 5 });
   return panicCfg.get(guildId);
 }
 function loadPanic() {
@@ -304,7 +305,8 @@ function loadPanic() {
       panicCfg.set(g, {
         enabled: c.enabled !== false,
         channelId: typeof c.channelId === 'string' ? c.channelId : null,
-        summons: summons.length ? summons : [...DEFAULT_SUMMONS]
+        summons: summons.length ? summons : [...DEFAULT_SUMMONS],
+        kicks: Number.isInteger(c.kicks) && c.kicks >= 1 && c.kicks <= 5 ? c.kicks : 5
       });
     }
     console.log('Panic cargado.');
@@ -1314,8 +1316,8 @@ client.on('messageCreate', async message => {
           `Canal: ${cfg.channelId ? `<#${cfg.channelId}>` : `(auto → ${ch ? `#${ch.name}` : 'ninguno con permiso'})`}`,
           `Summons (${cfg.summons.length}): ${cfg.summons.map((s, i) => `\`${i + 1}.\` \`${s}\``).join(' · ')}`,
           '',
-          `Se dispara con **${KICK_STREAK_MAX}+ kicks en 60s** (cooldown ${PANIC_COOLDOWN_MS / 60000} min): reentro yo + mando los summons.`,
-          `Cambios (admins): \`${prefix}panic on|off\` · \`${prefix}panic channel #canal|off\` · \`${prefix}panic add <texto>\` · \`${prefix}panic remove <nº|texto>\` · \`${prefix}panic test\``
+          `Se dispara con **${cfg.kicks} kick${cfg.kicks > 1 ? 's' : ''} en 60s** (cooldown ${PANIC_COOLDOWN_MS / 60000} min): reentro yo + mando los summons.`,
+          `Cambios (admins): \`${prefix}panic on|off\` · \`${prefix}panic kicks <1-5>\` · \`${prefix}panic channel #canal|off\` · \`${prefix}panic add <texto>\` · \`${prefix}panic remove <nº|texto>\` · \`${prefix}panic test\``
         ];
         return message.reply({ embeds: [embedBase(message).setTitle('🆘 Panic mode').setDescription(lines.join('\n'))] });
       };
@@ -1327,6 +1329,17 @@ client.on('messageCreate', async message => {
         cfg.enabled = after === 'on';
         savePanic();
         return message.reply({ embeds: [embedOk(message, 'Panic mode', `Panic mode **${cfg.enabled ? 'activado ✅' : 'desactivado ❌'}**.`)] });
+      }
+      if (after.startsWith('kicks')) {
+        const arg = afterRaw.replace(/^kicks\s*/i, '').trim();
+        const n = parseInt(arg, 10);
+        if (!Number.isInteger(n) || n < 1 || n > 5) {
+          return message.reply({ embeds: [embedErr(message, 'Número inválido', `Uso: \`${prefix}panic kicks <1-5>\` (actual: **${cfg.kicks}**).`)] });
+        }
+        cfg.kicks = n;
+        savePanic();
+        console.log(`[panic] ${message.author.tag} puso kicks=${n} en guild ${message.guild.id} (texto)`);
+        return message.reply({ embeds: [embedOk(message, 'Panic mode', `Panic con **${n} kick${n > 1 ? 's' : ''} en 60s**.`)] });
       }
       if (after.startsWith('channel')) {
         const arg = afterRaw.replace(/^channel\s*/i, '').trim();
