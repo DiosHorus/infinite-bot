@@ -151,7 +151,16 @@ const BOT_WATCH_INTERVAL_MS = 5000;
 const BOT_JOIN_GRACE_MS = 10000; // tras un join, el watchdog no sospecha
 const BOT_EXIT_DEDUP_MS = 30000; // misma salida no se procesa 2 veces
 const botJoinedAt = new Map(); // guildId -> timestamp del último join
-const handledBotExit = new Map(); // guildId -> timestamp de salida ya tratada
+// Dedup atado a la conexión: cada join/rejoin sube la generación. Una salida
+// solo se ignora si ya se trató ESTA generación (así un 2º kick rapidísimo,
+// que mata a una conexión más nueva, sí se procesa).
+const voiceGen = new Map(); // guildId -> generación de la conexión actual
+const handledBotExit = new Map(); // guildId -> { at, gen } de la salida ya tratada
+function nextVoiceGen(guildId) {
+  const n = (voiceGen.get(guildId) ?? 0) + 1;
+  voiceGen.set(guildId, n);
+  return n;
+}
 const botExitWatch = new Map(); // guildId -> última salida { at, channelId, channelName, expected, source, kickerId, kickerTag }
 function recordBotExit(guildId, info) {
   botExitWatch.set(guildId, { at: Date.now(), ...info });
@@ -160,20 +169,23 @@ function recordBotExit(guildId, info) {
 function getLastBotExit(guildId) {
   return botExitWatch.get(guildId) ?? null;
 }
-function wasBotExitHandled(guildId) {
-  const last = handledBotExit.get(guildId) ?? 0;
-  return Date.now() - last < BOT_EXIT_DEDUP_MS;
+function wasBotExitHandled(guildId, gen) {
+  const last = handledBotExit.get(guildId);
+  if (!last) return false;
+  if (Date.now() - last.at > BOT_EXIT_DEDUP_MS) return false;
+  return last.gen >= gen; // esta (o una más nueva) ya tratada; una gen mayor = kick nuevo
 }
-function markBotExitHandled(guildId) {
-  handledBotExit.set(guildId, Date.now());
+function markBotExitHandled(guildId, gen) {
+  handledBotExit.set(guildId, { at: Date.now(), gen });
 }
 // Ruta única para salidas NO previstas del bot: congela tiempos, limpia,
 // registra y dispara el enganche de medidas. `kicker` puede venir ya
 // resuelto (watchdog) o null (se atribuye por auditoría en 2º plano).
 function handleUnexpectedBotExit(guild, { channelId = null, channelName = null, source = 'event', kicker = undefined } = {}) {
   const gid = guild.id;
-  if (wasBotExitHandled(gid)) return false; // duplicada (evento + watchdog)
-  markBotExitHandled(gid);
+  const gen = voiceGen.get(gid) ?? 0;
+  if (wasBotExitHandled(gid, gen)) return false; // duplicada (evento + watchdog)
+  markBotExitHandled(gid, gen);
   console.warn(`[voz] BOT fuera de voz en guild ${gid} (${guild.name}) canal=${channelName ?? channelId ?? '?'} fuente=${source}. Congelo tiempos y limpio.`);
   finalizeGuildTimes(gid);
   try { getVoiceConnection(gid)?.destroy(); } catch { /* noop */ }
@@ -251,6 +263,7 @@ async function doRejoin(guild, channelId, note = '') {
       selfMute: false
     });
     callConnections.set(gid, connection);
+    nextVoiceGen(gid);
     setupAudioReceiver(connection, gid);
     attachConnectionHandlers(connection, gid);
     return connection;
@@ -270,7 +283,6 @@ async function doRejoin(guild, channelId, note = '') {
   }
   try {
     botJoinedAt.set(gid, Date.now());
-    handledBotExit.delete(gid); // el próximo kick real debe procesarse
     isRecording.set(gid, false);
     audioBuffers.delete(gid); // sesión nueva, como en join
     // Retomo tiempos de quienes siguen en el canal
@@ -1066,6 +1078,7 @@ client.on('messageCreate', async message => {
         callConnections.set(guildId, connection);
         setupAudioReceiver(connection, guildId);
         attachConnectionHandlers(connection, guildId);
+        nextVoiceGen(guildId);
         botJoinedAt.set(guildId, Date.now());
         isRecording.set(guildId, false);
         audioBuffers.delete(guildId); // sesión nueva: sin restos de audio anterior
@@ -1308,6 +1321,7 @@ client.on('messageCreate', async message => {
           callConnections.set(message.guild.id, connection);
           setupAudioReceiver(connection, message.guild.id);
           attachConnectionHandlers(connection, message.guild.id);
+          nextVoiceGen(message.guild.id);
           botJoinedAt.set(message.guild.id, Date.now());
           logEvent(message.guild.id, 'bot_join', client.user.id, client.user?.username ?? 'bot', `auto-join a ${message.member.voice.channel.name} por sonido de ${message.author.tag}`);
         } catch (e) {
@@ -1773,6 +1787,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         callConnections.set(gid, conn);
         setupAudioReceiver(conn, gid);
         attachConnectionHandlers(conn, gid);
+        nextVoiceGen(gid);
         botJoinedAt.set(gid, Date.now());
       } catch (e) {
         console.error(`[voz] BOT no pudo re-enganchar al canal nuevo en guild ${gid}:`, e.message);
