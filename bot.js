@@ -220,7 +220,24 @@ async function onBotRemoved(guild, { channelId = null, channelName = null, sourc
   } catch (e) {
     console.error(`[voz] fallo avisando kick en guild ${gid}:`, e.message);
   }
-  await rejoinP.catch(() => false);
+  const rejoined = await rejoinP.catch(() => false);
+  // Red de seguridad: si el rejoin no dejó conexión viva (fallo silencioso de
+  // Discord en rejoin rapidísimo), un reintento verificado. La racha cuenta,
+  // así que una pelea real sigue desembocando en panic (sin bucle infinito).
+  // Se salta si ya se trató una salida más nueva (esa lleva su propio rejoin).
+  if (!rejoined && channelId) {
+    await new Promise(r => setTimeout(r, 2500));
+    try {
+      const live = getVoiceConnection(gid);
+      const genNow = voiceGen.get(gid) ?? 0;
+      if ((!live || live.state?.status === VoiceConnectionStatus.Destroyed) && !wasBotExitHandled(gid, genNow)) {
+        console.warn(`[voz] guild ${gid}: rejoin sin efecto, reintento verificado...`);
+        await rejoinAfterKick(guild, { channelId, channelName });
+      }
+    } catch (e) {
+      console.error(`[voz] guild ${gid}: fallo en reintento verificado:`, e.message);
+    }
+  }
 }
 // Freno anti-bucle: más de N kicks en 60s = alguien peleando -> NO reentro,
 // se pasa al panic mode (pendiente de definir).
@@ -1748,11 +1765,16 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         recordBotExit(gid, { channelId: oldChannelId, channelName, expected: true, source: 'event', kickerId: null, kickerTag: null });
         logEvent(gid, 'bot_leave', client.user.id, client.user?.username ?? 'bot', `salida prevista de ${channelName ?? 'voz'}`);
       } else {
+        // Traza de decisión (para cazar el "2º kick no reentra"): se ve en logs.
+        const curConn = getVoiceConnection(gid);
+        const curStatus = curConn?.state?.status ?? 'none';
+        const curMeVoice = guild.members?.me?.voice?.channelId ?? null;
+        const genNow = voiceGen.get(gid) ?? 0;
+        const handled = handledBotExit.get(gid);
+        console.log(`[voz] BOT salida NO prevista en guild ${gid}: enVoz=${curMeVoice ?? 'no'} · conn=${curStatus} · gen=${genNow} · tratada=${handled ? `gen${handled.gen}@${Math.round((Date.now() - handled.at) / 1000)}s` : 'ninguna'}`);
         // Evento tardío/duplicado (ej. llegó tras nuestro rejoin): si sigo con
         // conexión viva y en voz según Discord, no toco nada.
-        const curConn = getVoiceConnection(gid);
-        const curMeVoice = guild.members?.me?.voice?.channelId ?? null;
-        if (curMeVoice && curConn && curConn.state?.status !== VoiceConnectionStatus.Destroyed) {
+        if (curMeVoice && curConn && curStatus !== VoiceConnectionStatus.Destroyed) {
           console.log(`[voz] BOT evento de salida tardío en guild ${gid}, ignoro (sigo en ${curMeVoice}).`);
           return;
         }
