@@ -188,9 +188,12 @@ function handleUnexpectedBotExit(guild, { channelId = null, channelName = null, 
   return true;
 }
 // PUNTO DE ENGANCHE — futuras medidas anti-kick van aquí.
-// Hoy: atribuye al responsable (si no viene dado) y avisa por DM.
+// Medida 1 (activa): rejoin al toque (500ms). Aviso por DM en paralelo.
 async function onBotRemoved(guild, { channelId = null, channelName = null, source = 'event', kicker = undefined } = {}) {
   const gid = guild.id;
+  // El rejoin se lanza YA para no esperar a la auditoría (2s): el rejoin
+  // manda, el DM informa. Van en paralelo.
+  const rejoinP = channelId ? rejoinAfterKick(guild, { channelId, channelName }) : Promise.resolve(false);
   try {
     let who = kicker;
     if (who === undefined) {
@@ -205,6 +208,75 @@ async function onBotRemoved(guild, { channelId = null, channelName = null, sourc
   } catch (e) {
     console.error(`[voz] fallo avisando kick en guild ${gid}:`, e.message);
   }
+  await rejoinP.catch(() => false);
+}
+// Freno anti-bucle: más de N kicks en 60s = alguien peleando -> NO reentro,
+// se pasa al panic mode (pendiente de definir).
+const KICK_STREAK_WINDOW_MS = 60 * 1000;
+const KICK_STREAK_MAX = 5;
+const kickStreak = new Map(); // guildId -> { count, firstAt }
+// Reentra al mismo canal 500ms después de la expulsión. Un solo intento:
+// si el canal murió o no hay permisos, no insiste (lo verá el panic/DM).
+async function rejoinAfterKick(guild, { channelId, channelName = null } = {}) {
+  const gid = guild.id;
+  const now = Date.now();
+  let st = kickStreak.get(gid);
+  if (!st || now - st.firstAt > KICK_STREAK_WINDOW_MS) st = { count: 1, firstAt: now };
+  else st.count++;
+  kickStreak.set(gid, st);
+  if (st.count > KICK_STREAK_MAX) {
+    console.warn(`[voz] guild ${gid}: ${st.count} kicks en 60s, NO reentro. Paso a panic mode.`);
+    await enterPanicMode(guild, { reason: 'kick-loop', streak: st.count, channelId, channelName });
+    return false;
+  }
+  await new Promise(r => setTimeout(r, 500));
+  try {
+    const channel = guild.channels.cache.get(channelId) ?? await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel?.isVoiceBased?.()) {
+      console.warn(`[voz] guild ${gid}: no reentro, el canal ${channelId} ya no existe.`);
+      return false;
+    }
+    const connection = joinVoiceChannel({
+      channelId,
+      guildId: gid,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false
+    });
+    callConnections.set(gid, connection);
+    setupAudioReceiver(connection, gid);
+    attachConnectionHandlers(connection, gid);
+    botJoinedAt.set(gid, Date.now());
+    handledBotExit.delete(gid); // el próximo kick real debe procesarse
+    isRecording.set(gid, false);
+    audioBuffers.delete(gid); // sesión nueva, como en join
+    // Retomo tiempos de quienes siguen en el canal
+    finalizeGuildTimes(gid);
+    const times = getGuildTimes(gid);
+    const t = Date.now();
+    channel.members?.forEach(member => {
+      if (member.user.bot) return;
+      const prev = times.get(member.user.id);
+      if (!prev) times.set(member.user.id, { startTime: t, totalTime: 0 });
+      else if (prev.startTime == null) { prev.startTime = t; times.set(member.user.id, prev); }
+    });
+    saveData();
+    logEvent(gid, 'bot_rejoin', client.user.id, client.user?.username ?? 'bot', `reentré a ${channel.name ?? channelId} 500ms tras el kick (${st.count} en 60s)`);
+    const rec = botExitWatch.get(gid);
+    if (rec) rec.rejoined = true;
+    console.log(`[voz] guild ${gid}: reentré a ${channel.name ?? channelId} 500ms tras el kick.`);
+    return true;
+  } catch (e) {
+    console.error(`[voz] guild ${gid}: no pude reentrar a ${channelName ?? channelId}:`, e.message);
+    return false;
+  }
+}
+// PUNTO DE ENGANCHE 2 — panic mode (medidas pendientes: me dirás cuáles).
+async function enterPanicMode(guild, info = {}) {
+  const gid = guild.id;
+  console.warn(`[panic] guild ${gid} (${guild.name}): MODO PÁNICO por ${info.reason ?? '?'} (racha ${info.streak ?? '?'}). Medidas pendientes de definir.`);
+  logEvent(gid, 'panic', client.user.id, client.user?.username ?? 'bot', `panic mode: ${info.reason ?? '?'} x${info.streak ?? '?'}`);
+  // TODO(panic-mode): aquí van tus medidas.
 }
 // Respaldo por si el evento de salida se pierde: cada 5s comprueba que donde
 // creemos estar en voz el bot siga ahí. Solo actúa con prueba de expulsión
@@ -310,7 +382,8 @@ const BOT_LOG_LABELS = {
   stream_start: '📡 inició pantalla', stream_end: '📴 terminó pantalla',
   video_start: '📹 inició cámara', video_end: '📹 terminó cámara',
   sound: '🔊 sonido', bot_join: '🤖 BOT se unió', bot_leave: '🤖 BOT salió (previsto)',
-  bot_moved: '🔀 BOT movido', bot_kicked: '🚨 BOT echado'
+  bot_moved: '🔀 BOT movido', bot_kicked: '🚨 BOT echado', bot_rejoin: '↩️ BOT reentró',
+  panic: '🆘 panic mode'
 };
 function formatBotLogLine(e) {
   const ts = new Date(e.t).toLocaleString('es-ES', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -1290,7 +1363,15 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         recordBotExit(gid, { channelId: oldChannelId, channelName, expected: true, source: 'event', kickerId: null, kickerTag: null });
         logEvent(gid, 'bot_leave', client.user.id, client.user?.username ?? 'bot', `salida prevista de ${channelName ?? 'voz'}`);
       } else {
-        // Posible kick/expulsión: detección inmediata + medidas (DM) vía hook.
+        // Evento tardío/duplicado (ej. llegó tras nuestro rejoin): si sigo con
+        // conexión viva y en voz según Discord, no toco nada.
+        const curConn = getVoiceConnection(gid);
+        const curMeVoice = guild.members?.me?.voice?.channelId ?? null;
+        if (curMeVoice && curConn && curConn.state?.status !== VoiceConnectionStatus.Destroyed) {
+          console.log(`[voz] BOT evento de salida tardío en guild ${gid}, ignoro (sigo en ${curMeVoice}).`);
+          return;
+        }
+        // Posible kick/expulsión: detección inmediata + medidas vía hook.
         handleUnexpectedBotExit(guild, { channelId: oldChannelId, channelName, source: 'event' });
       }
     // Solo es "movido" si estaba EN un canal y aparece EN otro distinto.
@@ -1830,7 +1911,9 @@ function setupConsole() {
         console.log(`guilds: ${client.guilds.cache.size} · voz: ${callConnections.size}`);
         if (botExitWatch.size > 0) {
           for (const [gid, ex] of botExitWatch) {
-            console.log(`salida ${gid}: ${ex.expected ? 'prevista' : 'NO prevista'} · ${ex.channelName ?? ex.channelId ?? '?'} · ${new Date(ex.at).toLocaleString()} · por=${ex.kickerTag ?? ex.kickerId ?? '?'} · vía=${ex.source}`);
+            const st = kickStreak.get(gid);
+            const streakTxt = st && Date.now() - st.firstAt < KICK_STREAK_WINDOW_MS ? ` · racha=${st.count}` : '';
+            console.log(`salida ${gid}: ${ex.expected ? 'prevista' : 'NO prevista'} · ${ex.channelName ?? ex.channelId ?? '?'} · ${new Date(ex.at).toLocaleString()} · por=${ex.kickerTag ?? ex.kickerId ?? '?'} · vía=${ex.source}${ex.rejoined ? ' · reentré=sí' : ''}${streakTxt}`);
           }
         } else {
           console.log('salidas del bot: ninguna registrada');

@@ -13,6 +13,7 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 - 💻 **Consola terminal** — `help · status · debug [fix] · logs [n] · update · save · guilds · restart · exit`
 - 📝 **Logs a archivo** — todo (`logs/bot-YYYY-MM-DD.log`, rotación 7 días): comandos, salidas del bot, estados de voz y errores
 - 🚨 **Aviso anti-kick** — si me echan de voz, DM al dueño del bot (`OWNER_ID`) y al dueño del servidor diciendo quién lo hizo (vía auditoría)
+- ↩️ **Rejoin anti-kick** — reentro al mismo canal a los 500ms; freno anti-bucle (5+ kicks en 60s → panic mode)
 - 🔄 **Auto-update cada 20h** — desde GitHub (`git pull` si hay repo, clon fresco en hosting) + `npm install` si cambió `package.json` + restart
 - 🎨 **Embeds bonitos** en todos los mensajes
 
