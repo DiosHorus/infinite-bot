@@ -203,6 +203,7 @@ function handleUnexpectedBotExit(guild, { channelId = null, channelName = null, 
 // Medida 1 (activa): rejoin al toque (500ms). Aviso por DM en paralelo.
 async function onBotRemoved(guild, { channelId = null, channelName = null, source = 'event', kicker = undefined } = {}) {
   const gid = guild.id;
+  stayOut.delete(gid); // salida no prevista: hay que estar dentro
   // El rejoin se lanza YA para no esperar a la auditoría (2s): el rejoin
   // manda, el DM informa. Van en paralelo.
   const rejoinP = channelId ? rejoinAfterKick(guild, { channelId, channelName }) : Promise.resolve(false);
@@ -220,23 +221,13 @@ async function onBotRemoved(guild, { channelId = null, channelName = null, sourc
   } catch (e) {
     console.error(`[voz] fallo avisando kick en guild ${gid}:`, e.message);
   }
-  const rejoined = await rejoinP.catch(() => false);
-  // Red de seguridad: si el rejoin no dejó conexión viva (fallo silencioso de
-  // Discord en rejoin rapidísimo), un reintento verificado. La racha cuenta,
-  // así que una pelea real sigue desembocando en panic (sin bucle infinito).
-  // Se salta si ya se trató una salida más nueva (esa lleva su propio rejoin).
-  if (!rejoined && channelId) {
-    await new Promise(r => setTimeout(r, 2500));
-    try {
-      const live = getVoiceConnection(gid);
-      const genNow = voiceGen.get(gid) ?? 0;
-      if ((!live || live.state?.status === VoiceConnectionStatus.Destroyed) && !wasBotExitHandled(gid, genNow)) {
-        console.warn(`[voz] guild ${gid}: rejoin sin efecto, reintento verificado...`);
-        await rejoinAfterKick(guild, { channelId, channelName });
-      }
-    } catch (e) {
-      console.error(`[voz] guild ${gid}: fallo en reintento verificado:`, e.message);
-    }
+  await rejoinP.catch(() => false);
+  // Garantía "siempre vuelve": si no estoy dentro, bucle de reintentos con
+  // backoff hasta conseguirlo (respeta leave, canal borrado y salida del server).
+  if (channelId) {
+    ensureRejoinLoop(guild, { channelId, channelName }).catch(e => {
+      console.error(`[voz] guild ${gid}: bucle anti-kick roto:`, e.message);
+    });
   }
 }
 // Freno anti-bucle: más de N kicks en 60s = alguien peleando -> NO reentro,
@@ -255,9 +246,11 @@ async function rejoinAfterKick(guild, { channelId, channelName = null } = {}) {
   kickStreak.set(gid, st);
   const maxKicks = getPanic(gid).kicks ?? KICK_STREAK_MAX;
   if (st.count >= maxKicks) {
-    console.warn(`[voz] guild ${gid}: ${st.count} kicks en 60s (límite ${maxKicks}), NO reentro. Paso a panic mode.`);
-    await enterPanicMode(guild, { reason: 'kick-loop', streak: st.count, channelId, channelName });
-    return false;
+    // "Siempre vuelve": no se deja de reintentar; el panic SUMA summons+DM.
+    console.warn(`[voz] guild ${gid}: ${st.count} kicks en 60s (límite ${maxKicks}), panic + sigo reintentando.`);
+    enterPanicMode(guild, { reason: 'kick-loop', streak: st.count, channelId, channelName }).catch(e => {
+      console.error(`[voz] guild ${gid}: fallo en panic:`, e.message);
+    });
   }
   return doRejoin(guild, channelId, `${st.count} en 60s`);
 }
@@ -333,6 +326,47 @@ async function doRejoin(guild, channelId, note = '') {
     console.warn(`[panic] guild ${gid}: no pude sonar la alarma:`, e.message);
   }
   return true;
+}
+// --- Bucle "siempre vuelve": tras un kick, reintenta hasta entrar ---
+// Backoff 2s/5s/10s y luego cada 15s, para siempre. Para solo si: orden de
+// quedarse fuera (leave), canal borrado, salida del servidor o ya dentro.
+// La racha cuenta en cada intento: una pelea real dispara el panic encima.
+const rejoinLoops = new Map(); // gid -> true mientras hay bucle activo
+const rejoinTarget = new Map(); // gid -> { channelId, channelName } (último canal)
+const stayOut = new Set(); // gid con orden explícita de quedarse fuera (leave)
+const REJOIN_BACKOFF_MS = [2000, 5000, 10000, 15000];
+function botSeemsInVoice(guild) {
+  try {
+    if (guild.members.me?.voice?.channelId) return true;
+    return getVoiceConnection(guild.id)?.state?.status === VoiceConnectionStatus.Ready;
+  } catch { return false; }
+}
+async function ensureRejoinLoop(guild, { channelId, channelName = null } = {}) {
+  const gid = guild.id;
+  rejoinTarget.set(gid, { channelId, channelName });
+  if (rejoinLoops.has(gid)) return; // ya hay uno corriendo con el objetivo nuevo
+  rejoinLoops.add(gid);
+  console.log(`[voz] guild ${gid}: bucle anti-kick activo (vuelvo siempre).`);
+  try {
+    let n = 0;
+    for (;;) {
+      if (stayOut.has(gid)) { console.log(`[voz] guild ${gid}: bucle parado (orden de quedarse fuera).`); return; }
+      const g = client.guilds.cache.get(gid);
+      if (!g) return; // salí del servidor
+      const tgt = rejoinTarget.get(gid) ?? { channelId, channelName };
+      const ch = g.channels.cache.get(tgt.channelId);
+      if (!ch?.isVoiceBased?.()) { console.warn(`[voz] guild ${gid}: el canal murió, paro el bucle.`); return; }
+      if (botSeemsInVoice(g)) return; // ¡dentro!
+      const wait = REJOIN_BACKOFF_MS[Math.min(n, REJOIN_BACKOFF_MS.length - 1)];
+      n++;
+      console.warn(`[voz] guild ${gid}: fuera de voz, reintento #${n} en ${wait / 1000}s...`);
+      await new Promise(r => setTimeout(r, wait));
+      if (stayOut.has(gid)) { console.log(`[voz] guild ${gid}: bucle parado (orden de quedarse fuera).`); return; }
+      await rejoinAfterKick(g, { channelId: tgt.channelId, channelName: tgt.channelName });
+    }
+  } finally {
+    rejoinLoops.delete(gid);
+  }
 }
 // --- Panic mode: si nos echan en bucle, se traen refuerzos ---
 // Manda en un canal de texto los comandos de join de otros bots
@@ -446,10 +480,7 @@ async function enterPanicMode(guild, info = {}) {
   }
   panicAt.set(gid, Date.now());
   console.warn(`[panic] guild ${gid} (${guild.name}): MODO PÁNICO por ${info.reason ?? '?'} (racha ${info.streak ?? '?'})`);
-  // 1) Infinity entra también (un intento, sin contar racha)
-  let back = false;
-  if (info.channelId) back = await doRejoin(guild, info.channelId, 'panic mode');
-  await new Promise(r => setTimeout(r, 1000));
+  // 1) Infinity lo intenta el bucle anti-kick ("siempre vuelve"); aquí summons+DM.
   // 2) Summons: comandos de join de otros bots en el chat
   const channel = resolvePanicChannel(guild);
   let sentCount = 0;
@@ -464,7 +495,7 @@ async function enterPanicMode(guild, info = {}) {
     }
   }
   const pasteBlock = cfg.summons.join('\n');
-  await dmOwners(guild, `🆘 **PANIC MODE** en **${guild.name}** (me echaron x${info.streak ?? '?'} en 60s).\nInfinity: ${back ? 'de vuelta en voz ✅' : 'no pudo reentrar ❌'}\nRefuerzos: ${sentCount}/${cfg.summons.length} summons en ${channel ? `#${channel.name}` : 'ningún canal (sin permiso de Enviar mensajes)'} (vía ${via}).\nSi los bots no entraron (ignoran mensajes no-humanos), pega esto en ${channel ? `#${channel.name}` : 'el chat'}:\n\`\`\`\n${pasteBlock}\n\`\`\`\nRachas en \`bot> status\`.`);
+  await dmOwners(guild, `🆘 **PANIC MODE** en **${guild.name}** (me echaron x${info.streak ?? '?'} en 60s).\nInfinity: reintentando entrar hasta conseguirlo ♻️\nRefuerzos: ${sentCount}/${cfg.summons.length} summons en ${channel ? `#${channel.name}` : 'ningún canal (sin permiso de Enviar mensajes)'} (vía ${via}).\nSi los bots no entraron (ignoran mensajes no-humanos), pega esto en ${channel ? `#${channel.name}` : 'el chat'}:\n\`\`\`\n${pasteBlock}\n\`\`\`\nRachas en \`bot> status\`.`);
   return true;
 }
 // --- Subida de la alarma del panic mode (sounds/panic.mp3) ---
@@ -1096,6 +1127,7 @@ client.on('messageCreate', async message => {
         setupAudioReceiver(connection, guildId);
         attachConnectionHandlers(connection, guildId);
         nextVoiceGen(guildId);
+        stayOut.delete(guildId);
         botJoinedAt.set(guildId, Date.now());
         isRecording.set(guildId, false);
         audioBuffers.delete(guildId); // sesión nueva: sin restos de audio anterior
@@ -1136,6 +1168,7 @@ client.on('messageCreate', async message => {
       console.log(`[cmd] leave guild=${guildId} por=${message.author.tag}`);
       finalizeGuildTimes(guildId);
       markExpectedLeave(guildId);
+      stayOut.add(guildId); // orden explícita: el bucle anti-kick no reentra
       try { conn.destroy(); } catch { /* noop */ }
       callConnections.delete(guildId);
       isRecording.set(guildId, false);
@@ -1339,6 +1372,7 @@ client.on('messageCreate', async message => {
           setupAudioReceiver(connection, message.guild.id);
           attachConnectionHandlers(connection, message.guild.id);
           nextVoiceGen(message.guild.id);
+          stayOut.delete(message.guild.id);
           botJoinedAt.set(message.guild.id, Date.now());
           logEvent(message.guild.id, 'bot_join', client.user.id, client.user?.username ?? 'bot', `auto-join a ${message.member.voice.channel.name} por sonido de ${message.author.tag}`);
         } catch (e) {
@@ -1457,7 +1491,7 @@ client.on('messageCreate', async message => {
           { name: '🔊 Sonidos', value: `\`${prefix}sounds\` lista · \`${prefix}s <nombre>\` reproduce.`, inline: false },
           { name: '📋 Logs', value: `\`${prefix}logs\` resumen 15 min · \`${prefix}bot_logs\` historial completo en .txt (incluye quién me echó).`, inline: false },
           { name: '🛡️ Admins (por defecto: dueño del server + dueño del bot)', value: `\`${prefix}admins\` ver · \`/addadmin @usuario\` · \`/removeadmin @usuario\` (en texto: \`${prefix}addadmin @usuario\`). Solo admins pueden sacarme (\`${prefix}leave\`) y gestionar admins.`, inline: false },
-          { name: '🆘 Panic mode (anti-kick: reentro al instante, con racha llamo refuerzos)', value: `\`${prefix}panic\` ver/configurar · \`/addpanicsound\` sube la alarma en voz (solo admins).`, inline: false },
+          { name: '🆘 Panic mode (vuelvo SIEMPRE; con racha llamo refuerzos)', value: `\`${prefix}panic\` ver/configurar · \`/addpanicsound\` sube la alarma en voz (solo admins).`, inline: false },
           { name: '⚙️ Prefijo', value: `\`/prefix nuevo:!\` (requiere Gestionar servidor) · ver con \`${prefix}prefix\`.`, inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
@@ -1810,6 +1844,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         setupAudioReceiver(conn, gid);
         attachConnectionHandlers(conn, gid);
         nextVoiceGen(gid);
+        stayOut.delete(gid);
         botJoinedAt.set(gid, Date.now());
       } catch (e) {
         console.error(`[voz] BOT no pudo re-enganchar al canal nuevo en guild ${gid}:`, e.message);
