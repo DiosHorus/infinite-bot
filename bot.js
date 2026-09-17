@@ -268,10 +268,22 @@ async function doRejoin(guild, channelId, note = '') {
       else if (prev.startTime == null) { prev.startTime = t; times.set(member.user.id, prev); }
     });
     saveData();
-    logEvent(gid, 'bot_rejoin', client.user.id, client.user?.username ?? 'bot', `reentré a ${channel.name ?? channelId} 500ms tras el kick${note ? ` (${note})` : ''}`);
+    logEvent(gid, 'bot_rejoin', client.user.id, client.user?.username ?? 'bot', `reentré a ${channel.name ?? channelId}${note ? ` (${note})` : ''}`);
     const rec = botExitWatch.get(gid);
     if (rec) rec.rejoined = true;
     console.log(`[voz] guild ${gid}: reentré a ${channel.name ?? channelId}${note ? ` (${note})` : ''}.`);
+    // Alarma en voz (opcional): si existe sounds/panic.mp3, suena al reentrar
+    // tras un kick para que los humanos del canal se enteren.
+    try {
+      const alarmPath = path.join(soundsDir, 'panic.mp3');
+      if (fs.existsSync(alarmPath)) {
+        const { player } = getGuildPlayer(gid, connection);
+        player.play(createAudioResource(alarmPath, { inputType: StreamType.Arbitrary }));
+        console.log(`[panic] guild ${gid}: alarma sonando.`);
+      }
+    } catch (e) {
+      console.warn(`[panic] guild ${gid}: no pude sonar la alarma:`, e.message);
+    }
     return true;
   } catch (e) {
     console.error(`[voz] guild ${gid}: no pude reentrar a ${channelId}:`, e.message);
@@ -1336,10 +1348,13 @@ client.on('messageCreate', async message => {
       const afterRaw = /^panic\s/i.test(cmdRaw) ? cmdRaw.replace(/^panic\s+/i, '') : '';
       const showStatus = () => {
         const ch = resolvePanicChannel(message.guild);
+        const alarmOk = fs.existsSync(path.join(soundsDir, 'panic.mp3'));
         const lines = [
           `Estado: **${cfg.enabled ? 'ON ✅' : 'OFF ❌'}**`,
+          `Kicks para disparar: **${cfg.kicks} en 60s**`,
           `Canal: ${cfg.channelId ? `<#${cfg.channelId}>` : `(auto → ${ch ? `#${ch.name}` : 'ninguno con permiso'})`}`,
           `Summons (${cfg.summons.length}): ${cfg.summons.map((s, i) => `\`${i + 1}.\` \`${s}\``).join(' · ')}`,
+          `Alarma en voz: ${alarmOk ? '**sounds/panic.mp3** ✅ (suena al reentrar tras kick)' : '❌ (sube un `sounds/panic.mp3` para activarla)'}`,
           '',
           `Se dispara con **${cfg.kicks} kick${cfg.kicks > 1 ? 's' : ''} en 60s** (cooldown ${PANIC_COOLDOWN_MS / 60000} min): reentro yo + mando los summons.`,
           `Cambios (admins): \`${prefix}panic on|off\` · \`${prefix}panic kicks <1-5>\` · \`${prefix}panic channel #canal|off\` · \`${prefix}panic add <texto>\` · \`${prefix}panic remove <nº|texto>\` · \`${prefix}panic test\``
