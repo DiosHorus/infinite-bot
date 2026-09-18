@@ -14,7 +14,7 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 - 📝 **Logs a archivo** — todo (`logs/bot-YYYY-MM-DD.log`, rotación 7 días): comandos, salidas del bot, estados de voz y errores
 - 🚨 **Aviso anti-kick** — si me echan de voz, DM al dueño del bot (`OWNER_ID`) y al dueño del servidor diciendo quién lo hizo (vía auditoría)
 - ↩️ **Siempre vuelve** — tras un kick reentro al instante y reintento con backoff hasta entrar (`leave` lo respeta); con racha de kicks → panic mode
-- 🆘 **Panic mode** — con racha de kicks (configurable 1-5 con `panic kicks`): reentro yo + mando en el chat los summons de otros bots (`!join`, `m!join`, `-join`, configurables con `panic`, solo admins) + alarma opcional en voz (`/addpanicsound`, solo admins)
+- 🆘 **Panic mode** — con racha de kicks (configurable 1-5 con `panic kicks`): alarma en voz + DM a dueños. Nunca escribe en el chat
 - 🔄 **Auto-update cada 20h** — desde GitHub (`git pull` si hay repo, clon fresco en hosting) + `npm install` si cambió `package.json` + restart
 - 🎨 **Embeds bonitos** en todos los mensajes
 

@@ -246,7 +246,7 @@ async function rejoinAfterKick(guild, { channelId, channelName = null } = {}) {
   kickStreak.set(gid, st);
   const maxKicks = getPanic(gid).kicks ?? KICK_STREAK_MAX;
   if (st.count >= maxKicks) {
-    // "Siempre vuelve": no se deja de reintentar; el panic SUMA summons+DM.
+    // "Siempre vuelve": no se deja de reintentar; el panic SUMA alarma+DM.
     console.warn(`[voz] guild ${gid}: ${st.count} kicks en 60s (límite ${maxKicks}), panic + sigo reintentando.`);
     enterPanicMode(guild, { reason: 'kick-loop', streak: st.count, channelId, channelName }).catch(e => {
       console.error(`[voz] guild ${gid}: fallo en panic:`, e.message);
@@ -368,19 +368,16 @@ async function ensureRejoinLoop(guild, { channelId, channelName = null } = {}) {
     rejoinLoops.delete(gid);
   }
 }
-// --- Panic mode: si nos echan en bucle, se traen refuerzos ---
-// Manda en un canal de texto los comandos de join de otros bots
-// (!join, m!join, -join...) para que entren, además de reentrar infinity.
+// --- Panic mode: escalado ante racha de kicks ---
+// El bucle anti-kick ("siempre vuelve") ya reintenta entrar; el panic suma
+// alarma en voz + DM a dueños. No escribe nada en el chat.
 // Config por servidor en panic.json (comando `panic`, solo admins).
 const PANIC_FILE = path.join(__dirname, 'panic.json');
-const PANIC_SUMMON_DELAY_MS = 800;
 const PANIC_COOLDOWN_MS = 5 * 60 * 1000;
-const PANIC_MAX_SUMMONS = 10;
-const DEFAULT_SUMMONS = ['!join', 'm!join', '-join'];
-const panicCfg = new Map(); // guildId -> { enabled, channelId|null, summons[] }
+const panicCfg = new Map(); // guildId -> { enabled, kicks }
 const panicAt = new Map(); // guildId -> último disparo
 function getPanic(guildId) {
-  if (!panicCfg.has(guildId)) panicCfg.set(guildId, { enabled: true, channelId: null, summons: [...DEFAULT_SUMMONS], kicks: 5 });
+  if (!panicCfg.has(guildId)) panicCfg.set(guildId, { enabled: true, kicks: 5 });
   return panicCfg.get(guildId);
 }
 function loadPanic() {
@@ -389,13 +386,8 @@ function loadPanic() {
     const raw = JSON.parse(fs.readFileSync(PANIC_FILE, 'utf8'));
     for (const [g, c] of Object.entries(raw)) {
       if (!c || typeof c !== 'object') continue;
-      const summons = Array.isArray(c.summons)
-        ? c.summons.filter(s => typeof s === 'string' && s.trim().length >= 1 && s.trim().length <= 50).slice(0, PANIC_MAX_SUMMONS)
-        : [...DEFAULT_SUMMONS];
       panicCfg.set(g, {
         enabled: c.enabled !== false,
-        channelId: typeof c.channelId === 'string' ? c.channelId : null,
-        summons: summons.length ? summons : [...DEFAULT_SUMMONS],
         kicks: Number.isInteger(c.kicks) && c.kicks >= 1 && c.kicks <= 5 ? c.kicks : 5
       });
     }
@@ -411,60 +403,7 @@ function savePanic() {
     console.error('No se pudo guardar panic.json:', e.message);
   }
 }
-function botCanSend(channel) {
-  try {
-    if (!channel?.isTextBased?.()) return false;
-    return !!channel.permissionsFor(client.user)?.has(PermissionFlagsBits.SendMessages);
-  } catch { return false; }
-}
-// Canal donde se mandan los summons: el configurado, si no el del sistema,
-// si no el primer canal de texto escribible (hilos no: los webhooks no van).
-function resolvePanicChannel(guild) {
-  const cfg = getPanic(guild.id);
-  if (cfg.channelId) {
-    const c = guild.channels.cache.get(cfg.channelId);
-    if (botCanSend(c)) return c;
-  }
-  const sys = guild.systemChannelId ? guild.channels.cache.get(guild.systemChannelId) : null;
-  if (botCanSend(sys)) return sys;
-  const sorted = [...guild.channels.cache.values()].filter(c => botCanSend(c) && !c.isThread?.()).sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
-  return sorted[0] ?? null;
-}
-const PANIC_WEBHOOK_NAME = 'Infinity Panic';
-// Webhook propio del canal para camuflar los summons (no salen a nombre del
-// bot). Requiere permiso Gestionar webhooks; si falla, se usa mensaje normal.
-async function getPanicWebhook(channel) {
-  try {
-    const hooks = await channel.fetchWebhooks();
-    const mine = hooks.find(w => w.owner?.id === client.user.id && w.name === PANIC_WEBHOOK_NAME);
-    if (mine) return mine;
-    return await channel.createWebhook({ name: PANIC_WEBHOOK_NAME, avatar: client.user.displayAvatarURL({ extension: 'png', size: 64 }) });
-  } catch (e) {
-    console.warn(`[panic] sin webhook en #${channel.name ?? channel.id}:`, e.message);
-    return null;
-  }
-}
-// Manda un summon: primero vía webhook (camuflado), si no mensaje del bot.
-// Devuelve 'webhook' | 'bot' | null (falló).
-async function sendSummon(channel, text) {
-  const hook = await getPanicWebhook(channel);
-  if (hook) {
-    try {
-      await hook.send({ content: text, username: PANIC_WEBHOOK_NAME });
-      return 'webhook';
-    } catch (e) {
-      console.warn(`[panic] webhook falló, pruebo mensaje normal:`, e.message);
-    }
-  }
-  try {
-    await channel.send(text);
-    return 'bot';
-  } catch (e) {
-    console.error(`[panic] no pude mandar '${text}':`, e.message);
-    return null;
-  }
-}
-// PUNTO DE ENGANCHE 2 — panic mode: infinity reentra + summons a otros bots + DM.
+// PUNTO DE ENGANCHE 2 — panic mode: alarma + DM (nada en el chat).
 async function enterPanicMode(guild, info = {}) {
   const gid = guild.id;
   const cfg = getPanic(gid);
@@ -480,22 +419,8 @@ async function enterPanicMode(guild, info = {}) {
   }
   panicAt.set(gid, Date.now());
   console.warn(`[panic] guild ${gid} (${guild.name}): MODO PÁNICO por ${info.reason ?? '?'} (racha ${info.streak ?? '?'})`);
-  // 1) Infinity lo intenta el bucle anti-kick ("siempre vuelve"); aquí summons+DM.
-  // 2) Summons: comandos de join de otros bots en el chat
-  const channel = resolvePanicChannel(guild);
-  let sentCount = 0;
-  let via = 'bot';
-  if (!channel) {
-    console.error(`[panic] guild ${gid}: sin canal de texto donde mandar summons (¿sin permiso de Enviar mensajes?).`);
-  } else {
-    for (const text of cfg.summons) {
-      const how = await sendSummon(channel, text);
-      if (how) { sentCount++; via = how; logEvent(gid, 'panic', client.user.id, client.user?.username ?? 'bot', `summon '${text}' en #${channel.name ?? channel.id} vía ${how}`); }
-      await new Promise(r => setTimeout(r, PANIC_SUMMON_DELAY_MS));
-    }
-  }
-  const pasteBlock = cfg.summons.join('\n');
-  await dmOwners(guild, `🆘 **PANIC MODE** en **${guild.name}** (me echaron x${info.streak ?? '?'} en 60s).\nInfinity: reintentando entrar hasta conseguirlo ♻️\nRefuerzos: ${sentCount}/${cfg.summons.length} summons en ${channel ? `#${channel.name}` : 'ningún canal (sin permiso de Enviar mensajes)'} (vía ${via}).\nSi los bots no entraron (ignoran mensajes no-humanos), pega esto en ${channel ? `#${channel.name}` : 'el chat'}:\n\`\`\`\n${pasteBlock}\n\`\`\`\nRachas en \`bot> status\`.`);
+  // Infinity lo intenta el bucle anti-kick ("siempre vuelve"); aquí alarma+DM.
+  await dmOwners(guild, `🆘 **PANIC MODE** en **${guild.name}** (me echaron x${info.streak ?? '?'} en 60s).\nInfinity: reintentando entrar hasta conseguirlo ♻️\nRachas en \`bot> status\`.`);
   return true;
 }
 // --- Subida de la alarma del panic mode (sounds/panic.mp3) ---
@@ -1491,7 +1416,7 @@ client.on('messageCreate', async message => {
           { name: '🔊 Sonidos', value: `\`${prefix}sounds\` lista · \`${prefix}s <nombre>\` reproduce.`, inline: false },
           { name: '📋 Logs', value: `\`${prefix}logs\` resumen 15 min · \`${prefix}bot_logs\` historial completo en .txt (incluye quién me echó).`, inline: false },
           { name: '🛡️ Admins (por defecto: dueño del server + dueño del bot)', value: `\`${prefix}admins\` ver · \`/addadmin @usuario\` · \`/removeadmin @usuario\` (en texto: \`${prefix}addadmin @usuario\`). Solo admins pueden sacarme (\`${prefix}leave\`) y gestionar admins.`, inline: false },
-          { name: '🆘 Panic mode (vuelvo SIEMPRE; con racha llamo refuerzos)', value: `\`${prefix}panic\` ver/configurar · \`/addpanicsound\` sube la alarma en voz (solo admins).`, inline: false },
+          { name: '🆘 Panic mode (vuelvo SIEMPRE; con racha alarma+DM)', value: `\`${prefix}panic\` ver/configurar/test · \`/addpanicsound\` sube la alarma (solo admins). Nunca escribo en el chat.`, inline: false },
           { name: '⚙️ Prefijo', value: `\`/prefix nuevo:!\` (requiere Gestionar servidor) · ver con \`${prefix}prefix\`.`, inline: false }
         )
         .setFooter({ text: `Pedido por ${message.author.username}` })
@@ -1499,24 +1424,20 @@ client.on('messageCreate', async message => {
       return message.reply({ embeds: [embed] });
     }
 
-    // Panic mode: ver/configurar summons. Cambios y test solo admins.
+    // Panic mode: ver/configurar. Cambios y test solo admins. No escribe en el chat.
     if (cmd === 'panic' || cmd.startsWith('panic ')) {
       const gid = message.guild.id;
       const cfg = getPanic(gid);
       const after = cmd === 'panic' ? '' : cmd.slice('panic '.length).trim();
-      const afterRaw = /^panic\s/i.test(cmdRaw) ? cmdRaw.replace(/^panic\s+/i, '') : '';
       const showStatus = () => {
-        const ch = resolvePanicChannel(message.guild);
         const alarmOk = fs.existsSync(path.join(soundsDir, 'panic.mp3'));
         const lines = [
           `Estado: **${cfg.enabled ? 'ON ✅' : 'OFF ❌'}**`,
           `Kicks para disparar: **${cfg.kicks} en 60s**`,
-          `Canal: ${cfg.channelId ? `<#${cfg.channelId}>` : `(auto → ${ch ? `#${ch.name}` : 'ninguno con permiso'})`}`,
-          `Summons (${cfg.summons.length}): ${cfg.summons.map((s, i) => `\`${i + 1}.\` \`${s}\``).join(' · ')}`,
-          `Alarma en voz: ${alarmOk ? '**sounds/panic.mp3** ✅ (suena al reentrar tras kick)' : '❌ (sube un `sounds/panic.mp3` para activarla)'}`,
+          `Alarma en voz: ${alarmOk ? '**sounds/panic.mp3** ✅ (suena al reentrar tras kick)' : '❌ (súbela con `/addpanicsound`)'}`,
           '',
-          `Se dispara con **${cfg.kicks} kick${cfg.kicks > 1 ? 's' : ''} en 60s** (cooldown ${PANIC_COOLDOWN_MS / 60000} min): reentro yo + mando los summons.`,
-          `Cambios (admins): \`${prefix}panic on|off\` · \`${prefix}panic kicks <1-5>\` · \`${prefix}panic channel #canal|off\` · \`${prefix}panic add <texto>\` · \`${prefix}panic remove <nº|texto>\` · \`${prefix}panic test\``
+          `Con racha: alarma + DM a dueños (nunca escribo en el chat).`,
+          `Cambios (admins): \`${prefix}panic on|off\` · \`${prefix}panic kicks <1-5>\` · \`${prefix}panic test\` (prueba la alarma)`
         ];
         return message.reply({ embeds: [embedBase(message).setTitle('🆘 Panic mode').setDescription(lines.join('\n'))] });
       };
@@ -1540,68 +1461,23 @@ client.on('messageCreate', async message => {
         console.log(`[panic] ${message.author.tag} puso kicks=${n} en guild ${message.guild.id} (texto)`);
         return message.reply({ embeds: [embedOk(message, 'Panic mode', `Panic con **${n} kick${n > 1 ? 's' : ''} en 60s**.`)] });
       }
-      if (after.startsWith('channel')) {
-        const arg = afterRaw.replace(/^channel\s*/i, '').trim();
-        if (/^(off|auto|none)$/i.test(arg) || !arg) {
-          cfg.channelId = null;
-          savePanic();
-          return message.reply({ embeds: [embedOk(message, 'Panic mode', 'Canal en **auto** (sistema o primer escribible).')] });
-        }
-        const mentioned = message.mentions?.channels?.first?.();
-        const idMatch = arg.match(/(\d{15,25})/);
-        const target = mentioned ?? (idMatch ? message.guild.channels.cache.get(idMatch[1]) : null);
-        if (!target?.isTextBased?.()) {
-          return message.reply({ embeds: [embedErr(message, 'Canal inválido', `Uso: \`${prefix}panic channel #canal\` (mención) o \`${prefix}panic channel off\` para auto.`)] });
-        }
-        cfg.channelId = target.id;
-        savePanic();
-        const warn = botCanSend(target) ? '' : '\n⚠️ Ojo: no tengo permiso de **Enviar mensajes** ahí.';
-        return message.reply({ embeds: [embedOk(message, 'Panic mode', `Summons en <#${target.id}>.${warn}`)] });
-      }
-      if (after.startsWith('add')) {
-        const text = afterRaw.replace(/^add\s*/i, '').trim();
-        if (!text || text.length > 50 || text.includes('\n') || /@(everyone|here)/i.test(text)) {
-          return message.reply({ embeds: [embedErr(message, 'Texto inválido', '1-50 caracteres, una línea, sin `@everyone`/`@here`.')] });
-        }
-        if (cfg.summons.length >= PANIC_MAX_SUMMONS) {
-          return message.reply({ embeds: [embedErr(message, 'Lleno', `Máximo ${PANIC_MAX_SUMMONS} summons. Quita uno con \`${prefix}panic remove <nº>\`.`)] });
-        }
-        if (cfg.summons.some(s => s.toLowerCase() === text.toLowerCase())) {
-          return message.reply({ embeds: [embedInfo(message, 'Ya existe', `\`${text}\` ya está en la lista.`)] });
-        }
-        cfg.summons.push(text);
-        savePanic();
-        return message.reply({ embeds: [embedOk(message, 'Summon añadido', `\`${text}\` (${cfg.summons.length}/${PANIC_MAX_SUMMONS}).`)] });
-      }
-      if (after.startsWith('remove') || after.startsWith('del ')) {
-        const arg = afterRaw.replace(/^(remove|del)\s*/i, '').trim();
-        if (cfg.summons.length <= 1) {
-          return message.reply({ embeds: [embedErr(message, 'No puedo', 'Debe quedar al menos 1 summon.')] });
-        }
-        let idx = -1;
-        if (/^\d+$/.test(arg)) idx = parseInt(arg, 10) - 1;
-        else idx = cfg.summons.findIndex(s => s.toLowerCase() === arg.toLowerCase());
-        if (idx < 0 || idx >= cfg.summons.length) {
-          return message.reply({ embeds: [embedErr(message, 'No lo encuentro', `Uso: \`${prefix}panic remove <nº|texto>\`. Lista con \`${prefix}panic\`.`)] });
-        }
-        const [gone] = cfg.summons.splice(idx, 1);
-        savePanic();
-        return message.reply({ embeds: [embedOk(message, 'Summon quitado', `Fuera: \`${gone}\`.`)] });
-      }
       if (after === 'test') {
-        const channel = resolvePanicChannel(message.guild);
-        if (!channel) {
-          return message.reply({ embeds: [embedErr(message, 'Sin canal', 'No tengo ningún canal de texto con permiso de Enviar mensajes.')] });
+        const conn = getLiveConnection(message.guild.id);
+        if (!conn) {
+          return message.reply({ embeds: [embedErr(message, 'No estoy en voz', `Entro con \`${prefix}join\` primero y prueba de nuevo.`)] });
         }
-        let n = 0;
-        let via = 'bot';
-        for (const text of cfg.summons) {
-          const how = await sendSummon(channel, text);
-          if (how) { n++; via = how; }
-          await new Promise(r => setTimeout(r, PANIC_SUMMON_DELAY_MS));
+        const alarmPath = path.join(soundsDir, 'panic.mp3');
+        if (!fs.existsSync(alarmPath)) {
+          return message.reply({ embeds: [embedErr(message, 'Sin alarma', 'Sube una con `/addpanicsound`.')] });
         }
-        logEvent(gid, 'panic', message.author.id, message.author.username, `test manual: ${n}/${cfg.summons.length} summons en #${channel.name ?? channel.id} vía ${via}`);
-        return message.reply({ embeds: [embedOk(message, 'Test panic', `Mandados **${n}/${cfg.summons.length}** summons en <#${channel.id}> (vía ${via}). Mira si entraron los bots.`)] });
+        try {
+          const { player } = getGuildPlayer(message.guild.id, conn);
+          player.play(createAudioResource(alarmPath, { inputType: StreamType.Arbitrary }));
+          logEvent(gid, 'panic', message.author.id, message.author.username, 'test manual de alarma');
+          return message.reply({ embeds: [embedOk(message, 'Test panic', '🔊 Sonando la alarma en el canal.')] });
+        } catch (e) {
+          return message.reply({ embeds: [embedErr(message, 'No pude sonarla', e.message)] });
+        }
       }
       return showStatus();
     }
