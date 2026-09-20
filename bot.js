@@ -1025,8 +1025,14 @@ client.on('messageCreate', async message => {
       }
       try {
         await message.reply({ embeds: [embedInfo(message, '🔄 Update manual', 'Comprobando GitHub…')] });
-        await checkForUpdates({ auto: false });
+        // restart:false para poder informar ANTES de reiniciar (si hay update,
+        // restartBot mataría el proceso y el "Resultado" nunca llegaría).
+        const updated = await checkForUpdates({ auto: false, restart: false });
         await message.reply({ content: `Resultado: ${lastUpdateResult}` }).catch(() => {});
+        if (updated) {
+          await new Promise(r => setTimeout(r, 1500)); // que llegue el mensaje
+          restartBot();
+        }
       } catch (e) {
         await message.reply({ content: `Falló el update: ${e.message}` }).catch(() => {});
       }
@@ -1936,7 +1942,7 @@ async function npmInstall(tag) {
   }
 }
 
-async function checkForUpdatesGit(tag) {
+async function checkForUpdatesGit(tag, restart = true) {
   await git(['fetch', 'origin', UPDATE_BRANCH]);
   const { stdout: status } = await git(['status', '-uno', '--porcelain', '-b']);
   const behind = status.match(/behind (\d+)/);
@@ -1962,12 +1968,16 @@ async function checkForUpdatesGit(tag) {
   }
   try { await fsp.writeFile(path.join(REPO_DIR, '.version'), after); } catch { /* noop */ }
   lastUpdateResult = `actualizado ${before} -> ${after}`;
+  if (!restart) {
+    console.log(`${tag} Reinicio diferido: que avise quien lo pidió y reinicie después.`);
+    return true;
+  }
   console.log(`${tag} Reiniciando para aplicar cambios...`);
   restartBot();
   return true;
 }
 
-async function checkForUpdatesFresh(tag) {
+async function checkForUpdatesFresh(tag, restart = true) {
   // Modo hosting: no hay .git, clono fresco a temp y copio por encima
   const local = await getLocalVersion();
   if (local === 'desconocida') {
@@ -2003,6 +2013,10 @@ async function checkForUpdatesFresh(tag) {
       }
     }
     lastUpdateResult = `actualizado ${local} -> ${remote}`;
+    if (!restart) {
+      console.log(`${tag} Reinicio diferido: que avise quien lo pidió y reinicie después.`);
+      return true;
+    }
     console.log(`${tag} Reiniciando para aplicar cambios...`);
     restartBot();
     return true;
@@ -2011,7 +2025,7 @@ async function checkForUpdatesFresh(tag) {
   }
 }
 
-async function checkForUpdates({ auto = false } = {}) {
+async function checkForUpdates({ auto = false, restart = true } = {}) {
   if (isUpdating) {
     console.log('[update] Ya hay una actualización en curso, omito.');
     return false;
@@ -2021,8 +2035,8 @@ async function checkForUpdates({ auto = false } = {}) {
   const tag = auto ? '[auto-update]' : '[update]';
   try {
     console.log(`${tag} Comprobando GitHub ${UPDATE_REPO}#${UPDATE_BRANCH}... (dir: ${REPO_DIR}, git: ${hasGitRepo() ? 'sí' : 'no'})`);
-    if (hasGitRepo()) return await checkForUpdatesGit(tag);
-    return await checkForUpdatesFresh(tag);
+    if (hasGitRepo()) return await checkForUpdatesGit(tag, restart);
+    return await checkForUpdatesFresh(tag, restart);
   } catch (e) {
     lastUpdateResult = `error: ${e.message}`;
     console.error(`${tag} Falló:`, e.message);
