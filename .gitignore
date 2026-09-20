@@ -4,6 +4,7 @@ timeData.json
 prefixes.json
 admins.json
 panic.json
+AGENTS.md
 clips/*.pcm
 clips/*.mp3
 package-lock.zip
