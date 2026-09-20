@@ -362,7 +362,12 @@ async function ensureRejoinLoop(guild, { channelId, channelName = null } = {}) {
       console.warn(`[voz] guild ${gid}: fuera de voz, reintento #${n} en ${wait / 1000}s...`);
       await new Promise(r => setTimeout(r, wait));
       if (stayOut.has(gid)) { console.log(`[voz] guild ${gid}: bucle parado (orden de quedarse fuera).`); return; }
-      await rejoinAfterKick(g, { channelId: tgt.channelId, channelName: tgt.channelName });
+      // El bucle NUNCA muere por un intento fallido: traga el error y sigue.
+      try {
+        await rejoinAfterKick(g, { channelId: tgt.channelId, channelName: tgt.channelName });
+      } catch (e) {
+        console.error(`[voz] guild ${gid}: reintento #${n} falló:`, e.message);
+      }
     }
   } finally {
     rejoinLoops.delete(gid);
