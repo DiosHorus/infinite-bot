@@ -207,17 +207,21 @@ async function onBotRemoved(guild, { channelId = null, channelName = null, sourc
   // El rejoin se lanza YA para no esperar a la auditoría (2s): el rejoin
   // manda, el DM informa. Van en paralelo.
   const rejoinP = channelId ? rejoinAfterKick(guild, { channelId, channelName }) : Promise.resolve(false);
+  let auditReason = 'ok';
   try {
     let who = kicker;
     if (who === undefined) {
-      who = await findVoiceKicker(guild, channelId);
+      const res = await findVoiceKicker(guild, channelId);
+      who = res.kicker;
+      auditReason = res.reason;
       const rec = botExitWatch.get(gid);
       if (rec) {
         rec.kickerId = who?.id ?? null;
         rec.kickerTag = who?.tag ?? null;
+        rec.auditNote = res.reason;
       }
     }
-    await notifyBotKicked(guild, { channelName, kicker: who ?? null });
+    await notifyBotKicked(guild, { channelName, kicker: who ?? null, auditReason });
   } catch (e) {
     console.error(`[voz] fallo avisando kick en guild ${gid}:`, e.message);
   }
@@ -530,31 +534,39 @@ function setupBotWatchdog() {
 }
 
 // Busca en la auditoría quién desconectó al bot de voz (requiere permiso
-// "Ver registro de auditoría"). Intento inmediato + un reintento a los 1.5s
-// (la entrada a veces llega tarde). Devuelve el executor o null.
+// "Ver registro de auditoría"). Paciente: reintenta a 1.5s/3s/5s porque la
+// entrada a veces tarda. Devuelve { kicker, reason }: 'ok'|'noperm'|'notfound'.
 async function findVoiceKicker(guild, channelId) {
   const scan = async () => {
     const me = client.user?.id;
-    if (!me || !guild?.fetchAuditLogs) return null;
-    const logs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberDisconnect, limit: 5 });
+    if (!me || !guild?.fetchAuditLogs) return { kicker: null, reason: 'notfound' };
+    let logs;
+    try {
+      logs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberDisconnect, limit: 10 });
+    } catch (e) {
+      if (e?.code === 50013 || e?.status === 403) return { kicker: null, reason: 'noperm' };
+      throw e;
+    }
     const now = Date.now();
     for (const entry of logs.entries.values()) {
       if (entry.target?.id !== me) continue;
       if (now - entry.createdTimestamp > 25000) continue;
       const entryChannelId = entry.extra?.channel?.id ?? entry.extra?.channelId ?? null;
       if (channelId && entryChannelId && entryChannelId !== channelId) continue;
-      if (entry.executor && entry.executor.id !== me) return entry.executor;
+      if (entry.executor && entry.executor.id !== me) return { kicker: entry.executor, reason: 'ok' };
     }
-    return null;
+    return { kicker: null, reason: 'notfound' };
   };
   try {
-    const first = await scan();
-    if (first) return first;
-    await new Promise(r => setTimeout(r, 1500));
-    return await scan();
+    for (const wait of [0, 1500, 3000, 5000]) {
+      if (wait) await new Promise(r => setTimeout(r, wait));
+      const res = await scan();
+      if (res.kicker || res.reason === 'noperm') return res;
+    }
+    return { kicker: null, reason: 'notfound' };
   } catch (e) {
     console.warn(`[voz] no pude leer audit logs en guild ${guild?.id}:`, e.message);
-    return null;
+    return { kicker: null, reason: 'notfound' };
   }
 }
 
@@ -579,9 +591,10 @@ async function dmOwners(guild, msg) {
 }
 // Avisa por DM a los dueños cuando echan al bot de voz, indicando quién lo
 // hizo. Registra el evento para bot_logs.
-async function notifyBotKicked(guild, { channelName, kicker } = {}) {
+async function notifyBotKicked(guild, { channelName, kicker, auditReason = 'ok' } = {}) {
   const gid = guild.id;
-  const kickerTxt = kicker ? `${kicker.tag ?? kicker.username ?? 'Desconocido'} (${kicker.id})` : 'desconocido (me falta permiso "Ver registro de auditoría" o fue una desconexión)';
+  const whyTxt = kicker ? '' : (auditReason === 'noperm' ? ' (sin permiso "Ver registro de auditoría")' : ' (sin rastro en auditoría)');
+  const kickerTxt = kicker ? `${kicker.tag ?? kicker.username ?? 'Desconocido'} (${kicker.id})` : `desconocido${whyTxt}`;
   logEvent(gid, 'bot_kicked', kicker?.id ?? '???', kicker?.username ?? kicker?.tag ?? 'Desconocido', `me echó de ${channelName ?? 'voz'} en ${guild.name}`);
   console.warn(`[voz] BOT echado en guild ${gid} (${guild.name}) canal=${channelName ?? '?'} por=${kickerTxt}`);
   const msg = `🚨 Me echaron de voz en **${guild.name}** (canal **${channelName ?? 'desconocido'}**).\nQuién me echó: **${kickerTxt}**\nHora: <t:${Math.floor(Date.now() / 1000)}:F>\nVuelve a meterme con \`join\` cuando quieras.`;
@@ -2191,6 +2204,23 @@ async function runDiagnostics({ fix = false } = {}) {
     } catch { zombies++; }
   }
   add('voz', zombies === 0, zombies ? `${zombies} conexión(es) zombie${fix ? ' (limpiadas)' : ' (corre "debug fix")'}` : `${callConnections.size} activa(s)`, zombies > 0 && fix);
+
+  // 12) Auditoría (para saber quién echa al bot de voz)
+  try {
+    const guilds = [...client.guilds.cache.values()];
+    if (guilds.length === 0) {
+      add('auditoria', true, 'sin guilds cacheados aún');
+    } else {
+      const no = [];
+      for (const g of guilds) {
+        try { await g.fetchAuditLogs({ limit: 1 }); }
+        catch { no.push(g.name); }
+      }
+      add('auditoria', no.length === 0, no.length ? `sin acceso en: ${no.join(', ')}` : `${guilds.length} servidor(es) OK`);
+    }
+  } catch (e) {
+    add('auditoria', false, e.message.split('\n')[0]);
+  }
 
   const ok = checks.filter(c => c.ok).length;
   console.log(`[debug] ${ok}/${checks.length} OK${fix ? ' (con reparación)' : ''}:`);
