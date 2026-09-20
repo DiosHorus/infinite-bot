@@ -48,6 +48,13 @@ const AUTO_UPDATE = process.env.NO_AUTO_UPDATE !== '1';
 let isUpdating = false;
 let lastUpdateCheck = null;
 let lastUpdateResult = 'nunca';
+let lastUpdateAppliedAt = null; // cuándo se aplicó un update de verdad
+let lastUpdateHow = '—'; // auto/manual · git pull/clon fresco
+// Dueño del bot (comandos secretos iadmin!*). Fail-closed: sin OWNER_ID nadie pasa.
+function iadminAllowed(userId) {
+  const o = botOwnerId();
+  return !!o && userId === o;
+}
 
 // guildId -> { chunks: Buffer[], byteLength: number }
 const audioBuffers = new Map();
@@ -1014,13 +1021,8 @@ client.on('messageCreate', async message => {
     // no se autoriza a nadie (antes caía a guild.ownerId y cualquier owner
     // de servidor podía forzar update+restart).
     if (content === 'iadmin!update') {
-      const cfgOwner = (process.env.OWNER_ID || '').trim();
-      if (!cfgOwner) {
-        console.log(`[iadmin] bloqueado (sin OWNER_ID configurado): ${message.author.tag} (${message.author.id})`);
-        return; // silencioso para no revelar el comando
-      }
-      if (message.author.id !== cfgOwner) {
-        console.log(`[iadmin] intento bloqueado de ${message.author.tag} (${message.author.id})`);
+      if (!iadminAllowed(message.author.id)) {
+        console.log(`[iadmin] update bloqueado de ${message.author.tag} (${message.author.id})`);
         return; // silencioso para no revelar el comando
       }
       try {
@@ -1035,6 +1037,39 @@ client.on('messageCreate', async message => {
         }
       } catch (e) {
         await message.reply({ content: `Falló el update: ${e.message}` }).catch(() => {});
+      }
+      return;
+    }
+
+    if (content === 'iadmin!ver') {
+      if (!iadminAllowed(message.author.id)) {
+        console.log(`[iadmin] ver bloqueado de ${message.author.tag} (${message.author.id})`);
+        return; // silencioso para no revelar el comando
+      }
+      try {
+        const ver = await getLocalVersion();
+        let commits = '';
+        if (hasGitRepo()) {
+          try {
+            const { stdout } = await git(['log', '--oneline', '-3']);
+            if (stdout.trim()) commits = '```\n' + stdout.trim().slice(0, 500) + '\n```';
+          } catch { /* sin git log, sigo */ }
+        }
+        const embed = embedBase(message)
+          .setTitle('📌 Versión y updates')
+          .setDescription(
+            `**Versión:** \`${ver}\`\n` +
+            `**Repo:** \`${UPDATE_REPO}#${UPDATE_BRANCH}\` (${hasGitRepo() ? 'git local' : 'hosting sin git'})\n` +
+            `**Último check:** ${lastUpdateCheck ? lastUpdateCheck.toLocaleString() : '—'}\n` +
+            `**Resultado:** ${lastUpdateResult}\n` +
+            `**Cómo:** ${lastUpdateHow}\n` +
+            `**Aplicado el:** ${lastUpdateAppliedAt ? lastUpdateAppliedAt.toLocaleString() : '—'}\n` +
+            `**Uptime:** ${Math.floor(process.uptime())}s` +
+            (commits ? `\n**Últimos commits:**\n${commits}` : '')
+          );
+        await message.reply({ embeds: [embed] }).catch(() => {});
+      } catch (e) {
+        await message.reply({ content: `Falló: ${e.message}` }).catch(() => {});
       }
       return;
     }
@@ -1968,6 +2003,7 @@ async function checkForUpdatesGit(tag, restart = true) {
   }
   try { await fsp.writeFile(path.join(REPO_DIR, '.version'), after); } catch { /* noop */ }
   lastUpdateResult = `actualizado ${before} -> ${after}`;
+  lastUpdateAppliedAt = new Date();
   if (!restart) {
     console.log(`${tag} Reinicio diferido: que avise quien lo pidió y reinicie después.`);
     return true;
@@ -2013,6 +2049,7 @@ async function checkForUpdatesFresh(tag, restart = true) {
       }
     }
     lastUpdateResult = `actualizado ${local} -> ${remote}`;
+    lastUpdateAppliedAt = new Date();
     if (!restart) {
       console.log(`${tag} Reinicio diferido: que avise quien lo pidió y reinicie después.`);
       return true;
@@ -2033,6 +2070,7 @@ async function checkForUpdates({ auto = false, restart = true } = {}) {
   isUpdating = true;
   lastUpdateCheck = new Date();
   const tag = auto ? '[auto-update]' : '[update]';
+  lastUpdateHow = `${auto ? 'auto' : 'manual'} · ${hasGitRepo() ? 'git pull' : 'clon fresco'}`;
   try {
     console.log(`${tag} Comprobando GitHub ${UPDATE_REPO}#${UPDATE_BRANCH}... (dir: ${REPO_DIR}, git: ${hasGitRepo() ? 'sí' : 'no'})`);
     if (hasGitRepo()) return await checkForUpdatesGit(tag, restart);
