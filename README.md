@@ -11,7 +11,7 @@ Bot de Discord **hours farmer**: se queda **24/7 en voz**, mide el tiempo de cad
 - ✂️ **Clips MP3** — convierte el buffer PCM con `ffmpeg`, con cooldown anti-spam (30s)
 - ⚙️ **Prefijo configurable** — `/prefix nuevo:!` por servidor (por defecto `c!`)
 - 💻 **Consola terminal** — `help · status · debug [fix] · logs [n] · update · save · guilds · restart · exit`
-- 📝 **Logs a archivo** — todo (`logs/bot-*.log`, 7 días) + categorías (`voz`/`cmd` 14d, `err` 30d): comandos, estados de voz y errores · ver con `bot> logs [cat] [n]` o `syslogs` (admins)
+- 📝 **Logs a archivo** — todo (`logs/bot-*.log`, 7 días) + categorías (`voz`/`cmd` 14d, `err` 30d): comandos, estados de voz y errores · ver con `bot> logs [cat] [n]`
 - 🚨 **Aviso anti-kick** — si me echan de voz, DM al dueño del bot (`OWNER_ID`) y al dueño del servidor diciendo quién lo hizo (vía auditoría)
 - ↩️ **Siempre vuelve** — tras un kick reentro al instante y reintento con backoff hasta entrar (`leave` lo respeta); con racha de kicks → panic mode
 - 🆘 **Panic mode** — con racha de kicks (configurable 1-5 con `panic kicks`): alarma en voz + DM a dueños. Nunca escribe en el chat

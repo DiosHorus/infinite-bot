@@ -910,6 +910,52 @@ function embedErr(message, title, desc) {
 function embedInfo(message, title, desc) {
   return embedBase(message, EMBED_COLOR).setTitle(title).setDescription(desc);
 }
+// Syslogs por MD (solo dueño): logs del sistema de todas las guilds.
+// Uso: "[todo|voz|cmd|err] [n]" (n = líneas, máx 200).
+async function handleSyslogs(message, argStr) {
+  const parts = argStr.split(/\s+/).filter(Boolean);
+  let kind = 'bot';
+  if (parts[0] && /^(todo|bot|voz|cmd|err)$/i.test(parts[0])) {
+    kind = parts.shift().toLowerCase();
+    if (kind === 'todo') kind = 'bot';
+  }
+  const n = Math.min(Math.max(parseInt(parts[0], 10) || 50, 1), 200);
+  const names = { bot: 'todo', voz: 'voz', cmd: 'comandos', err: 'errores' };
+  const file = logFileFor(new Date(), kind);
+  let dest;
+  try {
+    dest = await message.author.createDM();
+  } catch {
+    await message.reply('❌ No pude abrirte MD (¿los tienes cerrados?).').catch(() => {});
+    return;
+  }
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const tail = lines.slice(-n);
+    if (tail.length === 0) {
+      await dest.send({ embeds: [embedInfo(message, '📄 Syslogs', `Sin líneas hoy en **${names[kind]}**.`)] });
+    } else {
+      const txt = tail.join('\n');
+      if (txt.length <= 3500) {
+        await dest.send({ embeds: [embedBase(message).setTitle(`📄 Syslogs — ${names[kind]} (últimas ${tail.length})`).setDescription('```\n' + txt.slice(-3500) + '\n```')] });
+      } else {
+        const tmp = path.join(require('os').tmpdir(), `syslogs-${kind}-${Date.now()}.txt`);
+        try {
+          await fsp.writeFile(tmp, txt, 'utf8');
+          await dest.send({
+            embeds: [embedBase(message).setTitle(`📄 Syslogs — ${names[kind]} (últimas ${tail.length})`).setDescription('Retención: todo 7d · voz/cmd 14d · errores 30d.')],
+            files: [{ attachment: tmp, name: `syslogs-${kind}.txt` }]
+          });
+        } finally {
+          await fsp.unlink(tmp).catch(() => {});
+        }
+      }
+    }
+    await message.reply('📩 Te lo envié por MD.').catch(() => {});
+  } catch (e) {
+    await message.reply('❌ No pude mandarte el MD.').catch(() => {});
+  }
+}
 
 client.once('ready', async () => {
   console.log(`Bot listo como ${client.user.tag}!`);
@@ -1087,6 +1133,37 @@ client.on('messageCreate', async message => {
       } catch (e) {
         await message.reply({ content: `Falló: ${e.message}` }).catch(() => {});
       }
+      return;
+    }
+
+    if (content === 'iadmin!help') {
+      if (!iadminAllowed(message.author.id)) {
+        console.log(`[iadmin] help bloqueado de ${message.author.tag} (${message.author.id})`);
+        return; // silencioso para no revelar el comando
+      }
+      try {
+        const dest = await message.author.createDM();
+        const lines = [
+          '**`iadmin!update`** — comprueba GitHub, informa el resultado y reinicia si hay cambios.',
+          '**`iadmin!ver`** — versión, último check/resultado/método, cuándo se aplicó + últimos commits.',
+          '**`iadmin!syslogs [todo|voz|cmd|err] [n]`** — últimas n líneas del log del sistema por MD (máx 200).',
+          '',
+          '_Fijos: `/prefix` no los cambia. Retención: todo 7d · voz/cmd 14d · errores 30d._'
+        ];
+        await dest.send({ embeds: [embedBase(message).setTitle('🔐 Comandos iadmin (privados)').setDescription(lines.join('\n'))] });
+        await message.reply('📩 Te lo envié por MD.').catch(() => {});
+      } catch {
+        await message.reply('❌ No pude abrirte MD (¿los tienes cerrados?).').catch(() => {});
+      }
+      return;
+    }
+
+    if (content === 'iadmin!syslogs' || content.startsWith('iadmin!syslogs ')) {
+      if (!iadminAllowed(message.author.id)) {
+        console.log(`[iadmin] syslogs bloqueado de ${message.author.tag} (${message.author.id})`);
+        return; // silencioso para no revelar el comando
+      }
+      await handleSyslogs(message, content.slice('iadmin!syslogs'.length).trim());
       return;
     }
 
@@ -1489,7 +1566,7 @@ client.on('messageCreate', async message => {
           { name: '🔊 Voz y grabación', value: `\`${prefix}join\` entro a tu canal · \`${prefix}start\` grabo · \`${prefix}stop\` pauso · \`${prefix}clip\` MP3 últimos ${CLIP_SECONDS / 60} min (cooldown 30s) · \`${prefix}leave\` salgo (🛡️ admins)`, inline: false },
           { name: '🏆 Tiempo', value: `\`${prefix}lb\` top 10 del servidor.`, inline: false },
           { name: '🔊 Sonidos', value: `\`${prefix}sounds\` lista · \`${prefix}s <nombre>\` reproduce.`, inline: false },
-          { name: '📋 Logs', value: `\`${prefix}logs\` resumen 15 min · \`${prefix}bot_logs\` historial completo en .txt · \`${prefix}syslogs [todo|voz|cmd|err] [n]\` logs del sistema (🛡️ admins).`, inline: false },
+          { name: '📋 Logs', value: `\`${prefix}logs\` resumen 15 min · \`${prefix}bot_logs\` historial completo en .txt.`, inline: false },
           { name: '🛡️ Admins (por defecto: dueño del server + dueño del bot)', value: `\`${prefix}admins\` ver · \`/addadmin @usuario\` · \`/removeadmin @usuario\` (en texto: \`${prefix}addadmin @usuario\`). Solo admins pueden sacarme (\`${prefix}leave\`) y gestionar admins.`, inline: false },
           { name: '🆘 Panic mode (vuelvo SIEMPRE; con racha alarma+DM)', value: `\`${prefix}panic\` ver/configurar/test · \`/addpanicsound\` sube la alarma (solo admins). Nunca escribo en el chat.`, inline: false },
           { name: '⚙️ Prefijo', value: `\`/prefix nuevo:!\` (requiere Gestionar servidor) · ver con \`${prefix}prefix\`.`, inline: false }
@@ -1577,50 +1654,6 @@ client.on('messageCreate', async message => {
         console.error('Error en addpanicsound texto:', e.message);
         return wait.edit({ embeds: [embedErr(message, 'Falló la subida', 'Inténtalo de nuevo.')] }).catch(() => {});
       }
-    }
-
-    // Logs del sistema desde Discord (solo admins: cubren todos los servidores).
-    // Uso: syslogs [todo|voz|cmd|err] [n]  (n = líneas, máx 200)
-    if (cmd === 'syslogs' || cmd === 'syslog') {
-      if (!isBotAdmin(message.guild, message.author.id)) {
-        return message.reply({ embeds: [embedErr(message, 'Solo admins', 'Solo un admin del bot puede ver los logs del sistema.')] });
-      }
-      const parts = cmd.split(/\s+/).filter(Boolean).slice(1);
-      let kind = 'bot';
-      if (parts[0] && /^(todo|bot|voz|cmd|err)$/i.test(parts[0])) {
-        kind = parts.shift().toLowerCase();
-        if (kind === 'todo') kind = 'bot';
-      }
-      const n = Math.min(Math.max(parseInt(parts[0], 10) || 50, 1), 200);
-      const names = { bot: 'todo', voz: 'voz', cmd: 'comandos', err: 'errores' };
-      const file = logFileFor(new Date(), kind);
-      try {
-        const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-        const tail = lines.slice(-n);
-        if (tail.length === 0) {
-          return message.reply({ embeds: [embedInfo(message, '📄 Syslogs', `Sin líneas hoy en **${names[kind]}**.`)] });
-        }
-        const txt = tail.join('\n');
-        if (txt.length <= 3500) {
-          const embed = embedBase(message)
-            .setTitle(`📄 Syslogs — ${names[kind]} (últimas ${tail.length})`)
-            .setDescription('```\n' + txt.slice(-3500) + '\n```');
-          return message.reply({ embeds: [embed] });
-        }
-        const tmp = path.join(require('os').tmpdir(), `syslogs-${kind}-${Date.now()}.txt`);
-        try {
-          await fsp.writeFile(tmp, txt, 'utf8');
-          const embed = embedBase(message)
-            .setTitle(`📄 Syslogs — ${names[kind]} (últimas ${tail.length})`)
-            .setDescription(`Retención: todo 7d · voz/cmd 14d · errores 30d.`);
-          await message.reply({ embeds: [embed], files: [{ attachment: tmp, name: `syslogs-${kind}.txt` }] });
-        } finally {
-          await fsp.unlink(tmp).catch(() => {});
-        }
-      } catch (e) {
-        return message.reply({ embeds: [embedErr(message, 'No pude leerlos', e.message)] });
-      }
-      return;
     }
 
     if (cmd === 'prefix') {
