@@ -81,21 +81,26 @@ if (!fs.existsSync(soundsDir)) {
   fs.mkdirSync(soundsDir, { recursive: true });
 }
 
-// --- Logs a archivo (logs/bot-YYYY-MM-DD.log): todo lo que pasa por console + errores ---
-// Sirve para saber qué pasó cuando el bot se cae/sale solo. Rotación: se borran los de +7 días.
+// --- Logs a archivo: todo (bot-*.log) + por categorías (voz/cmd/err) ---
+// Sirve para saber qué pasó cuando el bot se cae/sale solo.
+// Retención: bot 7 días, voz/cmd 14 días, err 30 días.
 const logsDir = path.join(__dirname, 'logs');
 if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
-const LOG_KEEP_DAYS = 7;
-function logFileFor(d = new Date()) {
-  return path.join(logsDir, `bot-${d.toISOString().slice(0, 10)}.log`);
+const LOG_KEEP = { bot: 7, voz: 14, cmd: 14, err: 30 };
+const LOG_KINDS = ['bot', 'voz', 'cmd', 'err'];
+function logFileFor(d = new Date(), kind = 'bot') {
+  if (!LOG_KEEP[kind]) kind = 'bot';
+  return path.join(logsDir, `${kind}-${d.toISOString().slice(0, 10)}.log`);
 }
 function pruneOldLogs() {
   try {
-    const cutoff = Date.now() - LOG_KEEP_DAYS * 24 * 60 * 60 * 1000;
+    const now = Date.now();
     for (const f of fs.readdirSync(logsDir)) {
-      if (!/^bot-\d{4}-\d{2}-\d{2}\.log$/.test(f)) continue;
+      const m = f.match(/^(bot|voz|cmd|err)-(\d{4}-\d{2}-\d{2})\.log$/);
+      if (!m) continue;
+      const cutoff = now - LOG_KEEP[m[1]] * 24 * 60 * 60 * 1000;
       const p = path.join(logsDir, f);
       try {
         if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
@@ -103,11 +108,22 @@ function pruneOldLogs() {
     }
   } catch { /* noop */ }
 }
+// Nivel: ERROR/WARN -> err + bot. INFO con etiqueta -> su categoría + bot.
+const LOG_VOZ_RE = /^\[(voz|audio)\]/;
+const LOG_CMD_RE = /^\[(cmd|admin|iadmin|panic|update|auto-update|debug|dm|sound)\]/;
 function writeLogFile(level, args) {
   try {
     const ts = new Date().toISOString();
     const msg = args.map(a => (typeof a === 'string' ? a : inspect(a, { depth: 4, breakLength: 200 }))).join(' ');
-    fs.appendFileSync(logFileFor(), `[${ts}] [${level}] ${msg}\n`);
+    const line = `[${ts}] [${level}] ${msg}\n`;
+    fs.appendFileSync(logFileFor(new Date(), 'bot'), line);
+    if (level === 'ERROR' || level === 'WARN') {
+      fs.appendFileSync(logFileFor(new Date(), 'err'), line);
+    } else if (LOG_VOZ_RE.test(msg)) {
+      fs.appendFileSync(logFileFor(new Date(), 'voz'), line);
+    } else if (LOG_CMD_RE.test(msg)) {
+      fs.appendFileSync(logFileFor(new Date(), 'cmd'), line);
+    }
   } catch { /* nunca romper el bot por el log */ }
 }
 const _conLog = console.log.bind(console);
@@ -1473,7 +1489,7 @@ client.on('messageCreate', async message => {
           { name: '🔊 Voz y grabación', value: `\`${prefix}join\` entro a tu canal · \`${prefix}start\` grabo · \`${prefix}stop\` pauso · \`${prefix}clip\` MP3 últimos ${CLIP_SECONDS / 60} min (cooldown 30s) · \`${prefix}leave\` salgo (🛡️ admins)`, inline: false },
           { name: '🏆 Tiempo', value: `\`${prefix}lb\` top 10 del servidor.`, inline: false },
           { name: '🔊 Sonidos', value: `\`${prefix}sounds\` lista · \`${prefix}s <nombre>\` reproduce.`, inline: false },
-          { name: '📋 Logs', value: `\`${prefix}logs\` resumen 15 min · \`${prefix}bot_logs\` historial completo en .txt (incluye quién me echó).`, inline: false },
+          { name: '📋 Logs', value: `\`${prefix}logs\` resumen 15 min · \`${prefix}bot_logs\` historial completo en .txt · \`${prefix}syslogs [todo|voz|cmd|err] [n]\` logs del sistema (🛡️ admins).`, inline: false },
           { name: '🛡️ Admins (por defecto: dueño del server + dueño del bot)', value: `\`${prefix}admins\` ver · \`/addadmin @usuario\` · \`/removeadmin @usuario\` (en texto: \`${prefix}addadmin @usuario\`). Solo admins pueden sacarme (\`${prefix}leave\`) y gestionar admins.`, inline: false },
           { name: '🆘 Panic mode (vuelvo SIEMPRE; con racha alarma+DM)', value: `\`${prefix}panic\` ver/configurar/test · \`/addpanicsound\` sube la alarma (solo admins). Nunca escribo en el chat.`, inline: false },
           { name: '⚙️ Prefijo', value: `\`/prefix nuevo:!\` (requiere Gestionar servidor) · ver con \`${prefix}prefix\`.`, inline: false }
@@ -1561,6 +1577,50 @@ client.on('messageCreate', async message => {
         console.error('Error en addpanicsound texto:', e.message);
         return wait.edit({ embeds: [embedErr(message, 'Falló la subida', 'Inténtalo de nuevo.')] }).catch(() => {});
       }
+    }
+
+    // Logs del sistema desde Discord (solo admins: cubren todos los servidores).
+    // Uso: syslogs [todo|voz|cmd|err] [n]  (n = líneas, máx 200)
+    if (cmd === 'syslogs' || cmd === 'syslog') {
+      if (!isBotAdmin(message.guild, message.author.id)) {
+        return message.reply({ embeds: [embedErr(message, 'Solo admins', 'Solo un admin del bot puede ver los logs del sistema.')] });
+      }
+      const parts = cmd.split(/\s+/).filter(Boolean).slice(1);
+      let kind = 'bot';
+      if (parts[0] && /^(todo|bot|voz|cmd|err)$/i.test(parts[0])) {
+        kind = parts.shift().toLowerCase();
+        if (kind === 'todo') kind = 'bot';
+      }
+      const n = Math.min(Math.max(parseInt(parts[0], 10) || 50, 1), 200);
+      const names = { bot: 'todo', voz: 'voz', cmd: 'comandos', err: 'errores' };
+      const file = logFileFor(new Date(), kind);
+      try {
+        const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+        const tail = lines.slice(-n);
+        if (tail.length === 0) {
+          return message.reply({ embeds: [embedInfo(message, '📄 Syslogs', `Sin líneas hoy en **${names[kind]}**.`)] });
+        }
+        const txt = tail.join('\n');
+        if (txt.length <= 3500) {
+          const embed = embedBase(message)
+            .setTitle(`📄 Syslogs — ${names[kind]} (últimas ${tail.length})`)
+            .setDescription('```\n' + txt.slice(-3500) + '\n```');
+          return message.reply({ embeds: [embed] });
+        }
+        const tmp = path.join(require('os').tmpdir(), `syslogs-${kind}-${Date.now()}.txt`);
+        try {
+          await fsp.writeFile(tmp, txt, 'utf8');
+          const embed = embedBase(message)
+            .setTitle(`📄 Syslogs — ${names[kind]} (últimas ${tail.length})`)
+            .setDescription(`Retención: todo 7d · voz/cmd 14d · errores 30d.`);
+          await message.reply({ embeds: [embed], files: [{ attachment: tmp, name: `syslogs-${kind}.txt` }] });
+        } finally {
+          await fsp.unlink(tmp).catch(() => {});
+        }
+      } catch (e) {
+        return message.reply({ embeds: [embedErr(message, 'No pude leerlos', e.message)] });
+      }
+      return;
     }
 
     if (cmd === 'prefix') {
@@ -2305,7 +2365,7 @@ function setupConsole() {
       case '':
         break;
       case 'help':
-        console.log('Comandos: help · status · debug [fix] · update · restart · save · guilds · logs [n] · exit');
+        console.log('Comandos: help · status · debug [fix] · update · restart · save · guilds · logs [todo|voz|cmd|err] [n] · exit');
         console.log('  debug     -> chequea token, ffmpeg, git, deps, clips, jsons, discord y voz');
         console.log('  debug fix -> lo mismo + repara (npm install, jsons corruptos, temporales, zombies)');
         console.log('  update  -> git pull desde GitHub + npm install si cambió package.json + restart');
@@ -2346,13 +2406,21 @@ function setupConsole() {
         console.log('Datos guardados.');
         break;
       case 'logs': {
-        const n = Math.min(Math.max(parseInt(arg, 10) || 20, 1), 100);
+        // logs [todo|voz|cmd|err] [n]
+        const parts = arg.split(/\s+/).filter(Boolean);
+        let kind = 'bot';
+        if (parts[0] && /^(todo|bot|voz|cmd|err)$/i.test(parts[0])) {
+          kind = parts.shift().toLowerCase();
+          if (kind === 'todo') kind = 'bot';
+        }
+        const n = Math.min(Math.max(parseInt(parts[0], 10) || 20, 1), 200);
+        const file = logFileFor(new Date(), kind);
         try {
-          const lines = fs.readFileSync(logFileFor(), 'utf8').split('\n').filter(Boolean);
+          const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
           const tail = lines.slice(-n);
           if (tail.length === 0) _conLog('(log de hoy vacío)');
           else for (const line of tail) _conLog(line);
-          _conLog(`— últimas ${tail.length} líneas de ${path.basename(logFileFor())} —`);
+          _conLog(`— últimas ${tail.length} líneas de ${path.basename(file)} —`);
         } catch (e) {
           _conLog(`No pude leer el log: ${e.message}`);
         }
